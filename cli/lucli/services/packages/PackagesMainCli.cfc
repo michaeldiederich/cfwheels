@@ -10,13 +10,10 @@
  *   update --all --yes
  *   remove <name>
  *
- * `add` (not `install`!) is the install verb because LuCLI's built-in
- * extension installer intercepts the literal subcommand `install`
- * across all modules — same trap that bit `wheels browser install`
- * (renamed to `wheels browser setup` in #2345). User input
- * `wheels packages install <name>` never reaches Module.cfc; LuCLI
- * runs its own dependency installer against `lucee.json` instead and
- * prints "No git or extension dependencies to install".
+ * `add` is the documented install verb; `install` is an alias (see
+ * install() below). Older LuCLI runtimes intercepted the literal
+ * subcommand `install` before Module.cfc dispatched it (#2713); the
+ * runtime the CLI ships on now passes it through (#4206).
  *
  * Outputs plain text suitable for a terminal. Exit-code semantics are
  * the caller's job (Module.cfc throws to signal non-zero on fatal error;
@@ -29,8 +26,10 @@ component {
 		any registry = "",
 		any installer = "",
 		any resolver = "",
-		string runtimeVersion = ""
+		string runtimeVersion = "",
+		string projectRoot = ""
 	) {
+		variables.projectRoot = Len(arguments.projectRoot) ? arguments.projectRoot : ExpandPath("./");
 		variables.registry = IsObject(arguments.registry)
 			? arguments.registry
 			: new modules.wheels.services.packages.Registry();
@@ -45,6 +44,13 @@ component {
 			? arguments.runtimeVersion
 			: $detectRuntime();
 		return this;
+	}
+
+	/**
+	 * The framework version package compatibility is checked against.
+	 */
+	public string function runtimeVersion() {
+		return variables.runtime;
 	}
 
 	// ── Verbs ───────────────────────────────────────────────
@@ -159,12 +165,8 @@ component {
 		return $doInstall(local.parsed.name, local.parsed.pin, local.force);
 	}
 
-	// `install` is preserved as an alias for any in-process callers
-	// (specs, scripted clients) that haven't migrated to `add`. Note
-	// that the public CLI surface — `wheels packages install <name>` —
-	// never reaches this method because LuCLI's built-in extension
-	// installer intercepts the literal `install` subcommand before
-	// Module.cfc dispatches. See the component header.
+	// `install` is an alias for `add` on every path: the CLI, the MCP
+	// server, specs and scripted clients. See the component header.
 	public string function install(struct opts = {}) {
 		return add(argumentCollection = arguments);
 	}
@@ -335,6 +337,13 @@ component {
 	}
 
 	private string function $detectRuntime() {
+		// Tier 0 — the app's own framework (#3911). Packages install into
+		// this project and run on its vendor/wheels, so that is the version
+		// a package's wheelsVersion range has to match; the CLI's version
+		// only stands in outside a project.
+		local.projectVersion = $projectFrameworkVersion();
+		if (Len(local.projectVersion)) return local.projectVersion;
+
 		// Three-tier fallback. The original implementation tried to
 		// instantiate `wheels.Global` and call `$readFrameworkVersion()`,
 		// but in the LuCLI context the only registered mapping for the
@@ -373,9 +382,29 @@ component {
 			// BuildInfo unreachable; fall through.
 		}
 
-		// Tier 3 — sentinel. Matches "*" against any wheelsVersion
-		// constraint via the SemVer comparator (treated as a
-		// permissive dev build).
+		// Tier 3 — sentinel. VersionResolver treats it as a permissive dev
+		// build that satisfies every wheelsVersion constraint.
 		return "0.0.0-dev";
+	}
+
+	/**
+	 * The version in the project's vendor/wheels/wheels.json (box.json for
+	 * older apps), or "" when there is none or it is an unstamped build token.
+	 */
+	private string function $projectFrameworkVersion() {
+		local.dir = variables.projectRoot;
+		if (Right(local.dir, 1) != "/") local.dir &= "/";
+		for (local.file in ["wheels.json", "box.json"]) {
+			local.path = local.dir & "vendor/wheels/" & local.file;
+			if (!FileExists(local.path)) continue;
+			try {
+				local.data = DeserializeJSON(FileRead(local.path));
+				local.v = IsStruct(local.data) && IsSimpleValue(local.data.version ?: "") ? Trim(local.data.version ?: "") : "";
+				if (Len(local.v) && !Find("@", local.v)) return local.v;
+			} catch (any e) {
+				// Unreadable manifest; try the next one, then the CLI tiers.
+			}
+		}
+		return "";
 	}
 }

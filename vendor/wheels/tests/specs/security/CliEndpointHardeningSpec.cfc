@@ -62,9 +62,14 @@ component extends="wheels.WheelsTest" {
 						"renameSystemTables",
 						"forgetVersion",
 						"pretendVersion",
+						"migrationUnlock",
 						"jobsProcessNext",
 						"jobsRetry",
-						"jobsPurge"
+						"jobsPurge",
+						"jobsEnqueue",
+						"jobsDrain",
+						"jobsResume",
+						"jobsTick"
 					];
 					for (var name in mutating) {
 						expect(state.publicCfc.$cliCommandIsMutating(name)).toBeTrue("expected #name# to be mutating");
@@ -75,6 +80,7 @@ component extends="wheels.WheelsTest" {
 					var readOnly = [
 						"info",
 						"doctor",
+						"migrationLockStatus",
 						"dbStatus",
 						"dbVersion",
 						"dbSchema",
@@ -89,7 +95,8 @@ component extends="wheels.WheelsTest" {
 						"routes",
 						"introspect",
 						"jobsStatus",
-						"jobsMonitor"
+						"jobsMonitor",
+						"jobsHostStatus"
 					];
 					for (var name in readOnly) {
 						expect(state.publicCfc.$cliCommandIsMutating(name)).toBeFalse("expected #name# to be read-only");
@@ -144,6 +151,30 @@ component extends="wheels.WheelsTest" {
 					);
 					expect(gate.allowed).toBeFalse();
 					expect(gate.statusCode).toBe(403);
+				});
+
+				it("treats only IP literals as loopback: no host names, short forms or zone ids", () => {
+					for (var hop in ["localhost", "127.1", "::1%lo0", "ip6-localhost"]) {
+						var viaHop = state.publicCfc.$cliMutationGateCheck(
+							requestMethod = "POST",
+							remoteAddr = "127.0.0.1",
+							forwardedFor = hop,
+							password = "test-secret-123"
+						);
+						expect(viaHop.allowed).toBeFalse(hop);
+					}
+					var shortPeer = state.publicCfc.$cliMutationGateCheck(
+						requestMethod = "POST",
+						remoteAddr = "127.1",
+						password = "test-secret-123"
+					);
+					expect(shortPeer.allowed).toBeFalse();
+					var scopedPeer = state.publicCfc.$cliMutationGateCheck(
+						requestMethod = "POST",
+						remoteAddr = "0:0:0:0:0:0:0:1%0",
+						password = "test-secret-123"
+					);
+					expect(scopedPeer.allowed).toBeTrue();
 				});
 
 				it("fails closed when the configured reload password is empty", () => {

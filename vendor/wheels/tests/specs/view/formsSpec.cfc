@@ -1,5 +1,33 @@
 component extends="wheels.WheelsTest" {
 
+	/**
+	 * These specs assert the framework's default form-helper output. An app
+	 * built with `wheels new` changes it in config/settings.cfm
+	 * (includeFormErrorMessages=true, and labelPlacement="before" for the
+	 * text-like helpers), and the core suite runs with the host app's
+	 * settings. So pin the framework defaults for this bundle and put the
+	 * app's values back afterwards.
+	 */
+	function beforeAll() {
+		// The tag class's validations as configured, to check nothing below leaves one behind.
+		variables.tagValidationsAtStart = SerializeJSON(application.wo.$canonicalCacheValue(value = application.wo.model("tag").$classData().validations));
+		variables.pinnedFormSettings = {includeFormErrorMessages = application.wheels.includeFormErrorMessages, labelPlacement = {}};
+		application.wheels.includeFormErrorMessages = false;
+		for (var helperName in ListToArray("textField,textArea,passwordField,select,fileField,emailField,urlField,numberField,telField,dateField,searchField,colorField,rangeField")) {
+			if (StructKeyExists(application.wheels.functions, helperName) && StructKeyExists(application.wheels.functions[helperName], "labelPlacement")) {
+				variables.pinnedFormSettings.labelPlacement[helperName] = application.wheels.functions[helperName].labelPlacement;
+				application.wheels.functions[helperName].labelPlacement = "around";
+			}
+		}
+	}
+
+	function afterAll() {
+		application.wheels.includeFormErrorMessages = variables.pinnedFormSettings.includeFormErrorMessages;
+		for (var helperName in variables.pinnedFormSettings.labelPlacement) {
+			application.wheels.functions[helperName].labelPlacement = variables.pinnedFormSettings.labelPlacement[helperName];
+		}
+	}
+
 	function run() {
 
 		g = application.wo
@@ -404,12 +432,17 @@ component extends="wheels.WheelsTest" {
 				g.set(functionName = "textFieldTag", encode = false)
 				// Reset tag model for BoxLang compatibility
 				tagModel = g.model("tag")
+				// validatesPresenceOf() on a tag object registers on the shared tag class, so a later
+				// tag save anywhere in the run would fail it; put the class's validations back after.
+				savedTagValidations = Duplicate(tagModel.$classData().validations)
 			})
 
 			afterEach(() => {
 				g.set(functionName = "checkBoxTag", encode = true)
 				g.set(functionName = "textField", encode = true)
 				g.set(functionName = "textFieldTag", encode = true)
+				var tagClass = g.model("tag").$classData()
+				tagClass.validations = Duplicate(savedTagValidations)
 			})
 
 			it("adds label to the left", () => {
@@ -524,6 +557,13 @@ component extends="wheels.WheelsTest" {
 
 				expect(errors).toHaveLength(1)
 				expect(errors[1].message).toBe("Virtual property can't be empty")
+			})
+		})
+
+		describe("The tag class after the label specs", () => {
+
+			it("keeps only the validations it was configured with", () => {
+				expect(SerializeJSON(application.wo.$canonicalCacheValue(value = g.model("tag").$classData().validations))).toBe(variables.tagValidationsAtStart)
 			})
 		})
 
@@ -864,8 +904,7 @@ component extends="wheels.WheelsTest" {
 				g.set(functionName = "startFormTag", encode = false)
 				request.$wheelsProtectedFromForgery = true
 				// Save and configure routes so "root" route is available
-				_savedRoutes = Duplicate(application.wheels.routes)
-				_savedNamedRoutePositions = StructKeyExists(application.wheels, "namedRoutePositions") ? StructCopy(application.wheels.namedRoutePositions) : {}
+				_routeSnapshot = $snapshotRoutes()
 				_savedRewrite = application.wheels.URLRewriting
 				application.wheels.URLRewriting = "On"
 				$clearRoutes()
@@ -880,8 +919,7 @@ component extends="wheels.WheelsTest" {
 			afterEach(() => {
 				g.set(functionName = "startFormTag", encode = true)
 				request.$wheelsProtectedFromForgery = false
-				application.wheels.routes = _savedRoutes
-				application.wheels.namedRoutePositions = _savedNamedRoutePositions
+				$restoreRoutes(_routeSnapshot)
 				application.wheels.URLRewriting = _savedRewrite
 			})
 
@@ -1367,9 +1405,4 @@ component extends="wheels.WheelsTest" {
 		user.birthday = arguments.value;
 	}
 
-	public void function $clearRoutes() {
-		application.wheels.routes = [];
-		application.wheels.staticRoutes = {};
-		application.wheels.namedRoutePositions = {};
-	}
 }

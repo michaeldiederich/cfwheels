@@ -60,7 +60,13 @@ jobs:
   #############################################
   build:
     name: Build & Publish Release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    # Stable runs queue instead of overlapping, so two quick pushes to main
+    # can't both pass the republish check before either uploads (#4221).
+    # Snapshot runs get a unique group and never wait.
+    concurrency:
+      group: ${{ github.ref == 'refs/heads/main' && 'release-stable' || format('release-{0}', github.run_id) }}
+      cancel-in-progress: false
     steps:
       - name: Checkout Repository
         id: Checkout-Repository
@@ -92,6 +98,18 @@ jobs:
             echo "WHEELS_VERSION=${BASE_VERSION}" >> $GITHUB_ENV
             echo "BRANCH=main" >> $GITHUB_ENV
           fi
+
+      # A published version's assets never change (#4221). Without this check a
+      # push to main whose wheels.json still names a released version rebuilt
+      # and replaced that release's assets in place (v4.1.0, 2026-09-17), and
+      # republished it to ForgeBox. It runs before any build or publish step
+      # and fails closed. The decision (and its fixtures) lives in
+      # tools/ci/release_republish_guard.py.
+      - name: Refuse to republish an existing release
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tools/ci/release_republish_guard.py --repo "$GITHUB_REPOSITORY" --tag "v${WHEELS_VERSION}" --sha "$GITHUB_SHA"
 
       - name: Make build scripts executable
         run: |
@@ -146,6 +164,45 @@ jobs:
 
           echo "✓ Release checklist validation passed"
 
+      # `wheels lookup` (and its MCP tool) reads an offline docs index shipped
+      # inside the module, cli/lucli/data/docs-index.json. It is built here,
+      # before anything is published, so a failure can't leave a version on
+      # ForgeBox with no GitHub release or module behind it (#4314).
+      #
+      # It has to describe this build's framework version:
+      #   - a release (main) reads the committed docs/api/v<version>.json, with
+      #     --strict, so a missing file fails the build with the reason;
+      #   - a snapshot build reads the API JSON the snapshot workflow's fast-test
+      #     job generated from the running framework (artifact api-docs-snapshot),
+      #     also with --strict;
+      #   - a manual run on develop has no fast-test artifact, so it builds from
+      #     the newest API JSON committed and says so in a warning, rather than
+      #     failing the recovery path.
+      - name: Setup Node for Docs Index
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Download API docs snapshot
+        id: api-docs-snapshot
+        if: env.BRANCH == 'develop'
+        continue-on-error: true
+        uses: actions/download-artifact@v6
+        with:
+          name: api-docs-snapshot
+          path: docs/api
+
+      - name: Build Docs Index For wheels lookup
+        env:
+          SNAPSHOT_API_JSON: ${{ steps.api-docs-snapshot.outcome }}
+        run: |
+          if [ "$BRANCH" = "main" ] || [ "$SNAPSHOT_API_JSON" = "success" ]; then
+            node tools/build/scripts/build-docs-index.mjs --strict --version "$WHEELS_VERSION"
+          else
+            echo "::warning title=Docs index::No api-docs-snapshot artifact (a manual run on develop?), so the wheels lookup index uses the newest committed API JSON instead of this build's."
+            node tools/build/scripts/build-docs-index.mjs --version "$WHEELS_VERSION"
+          fi
+
       #############################################
       # Prepare and Publish to ForgeBox
       #############################################
@@ -178,7 +235,10 @@ jobs:
       - name: Install CommandBox
         if: github.ref == 'refs/heads/main'
         run: |
-          curl -fsSl https://downloads.ortussolutions.com/debs/gpg | sudo gpg --dearmor -o /usr/share/keyrings/ortussolutions.gpg
+          # Download to a file first: a retry after partial output would corrupt
+          # what gpg reads if curl piped straight into it.
+          curl -fsSL --retry 3 --retry-delay 2 --retry-all-errors -o "${RUNNER_TEMP}/ortussolutions.gpg.asc" https://downloads.ortussolutions.com/debs/gpg
+          sudo gpg --dearmor -o /usr/share/keyrings/ortussolutions.gpg "${RUNNER_TEMP}/ortussolutions.gpg.asc"
           echo "deb [signed-by=/usr/share/keyrings/ortussolutions.gpg] https://downloads.ortussolutions.com/debs/noarch /" | sudo tee /etc/apt/sources.list.d/ortussolutions.list
           sudo apt-get update && sudo apt-get install -y commandbox
 
@@ -234,8 +294,11 @@ jobs:
             echo "  Version: $VERSION"
 
             # Check that version matches expected version
+            # Fatal: a mismatched manifest still publishes, under the wrong
+            # version (the starter app shipped as 1.0.0 on every release, #3908).
             if [[ "$VERSION" != "${{ env.WHEELS_VERSION }}" ]]; then
-              echo "  WARNING: Version mismatch! Expected ${{ env.WHEELS_VERSION }}, got $VERSION"
+              echo "  ERROR: Version mismatch! Expected ${{ env.WHEELS_VERSION }}, got $VERSION"
+              exit 1
             fi
 
             # Count files
@@ -269,17 +332,8 @@ jobs:
           echo "=========================================="
           ./tools/build/scripts/ship-consumer-docs.sh check
 
-          for pkg in build-wheels-core/wheels build-wheels-starterApp; do
-            if [ ! -f "$pkg/CLAUDE.md" ] || [ ! -f "$pkg/AGENTS.md" ]; then
-              echo "ERROR: $pkg is missing the consumer AI docs (CLAUDE.md / AGENTS.md)"
-              exit 1
-            fi
-            for leaked in docs/superpowers docs/plans .claude .github CLAUDE.local.md; do
-              if [ -e "$pkg/$leaked" ]; then
-                echo "ERROR: $pkg leaks maintainer-only path: $leaked"
-                exit 1
-              fi
-            done
+          for pkg in build-wheels-base build-wheels-core/wheels build-wheels-starterApp; do
+            ./tools/build/scripts/ship-consumer-docs.sh verify "$pkg"
           done
           echo "  ✓ Two-tier AI docs validated"
 
@@ -349,7 +403,9 @@ jobs:
           # report a stale version. (Historically mirrored the same substitution
           # the now-frozen prepare-cli.sh did for the legacy wheels-cli ForgeBox
           # artifact; that leg was removed in #3184.) See #2326.
-          find cli/lucli -type f \( -name "*.json" -o -name "*.md" -o -name "*.cfm" -o -name "*.cfc" \) -exec sed -i.bak "s/@build\.version@/${MODULE_VERSION}/g" {} \;
+          # data/ (the docs index) is skipped: the guides it holds quote the
+          # placeholder literally.
+          find cli/lucli -type f \( -name "*.json" -o -name "*.md" -o -name "*.cfm" -o -name "*.cfc" \) -not -path "cli/lucli/data/*" -exec sed -i.bak "s/@build\.version@/${MODULE_VERSION}/g" {} \;
           find cli/lucli -name "*.bak" -delete
           # Generate .module-version at build time with the canonical version.
           # This file is read at runtime by the brew/scoop/.deb/.rpm wrappers
@@ -374,7 +430,7 @@ jobs:
 
       # Build .deb / .rpm Linux packages alongside the zip artifacts. nfpm
       # needs no Linux-specific build host (it's a single Go binary), so this
-      # runs on the same ubuntu-latest runner as the rest of the pipeline.
+      # runs on the same ubuntu-24.04 runner as the rest of the pipeline.
       # Generates arch-independent wheels_<v>_all.deb and wheels-<v>.noarch.rpm.
       # See tools/distribution-drafts/linux-packages/ for the nfpm configs.
       - name: Install nfpm
@@ -383,7 +439,7 @@ jobs:
           # From the release's checksums.txt; bump together with NFPM_VERSION.
           NFPM_SHA256="535962c4771db671352884b5591254481f851822557ad8476605c1e77a12504c"
           NFPM_TGZ="${RUNNER_TEMP}/nfpm.tar.gz"
-          curl -fsSL -o "${NFPM_TGZ}" \
+          curl -fsSL --retry 3 --retry-delay 2 --retry-all-errors -o "${NFPM_TGZ}" \
             "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz"
           echo "${NFPM_SHA256}  ${NFPM_TGZ}" | sha256sum -c -
           sudo tar -xzf "${NFPM_TGZ}" -C /usr/local/bin nfpm
@@ -809,7 +865,7 @@ jobs:
   smoke-test-distribution:
     name: Smoke Test Installed Distribution
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4

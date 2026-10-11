@@ -1,0 +1,41 @@
+---
+title: "wheels deploy server bootstrap"
+description: Install Docker on a fresh host. Idempotent — safe to re-run.
+type: reference
+sidebar:
+  label: "bootstrap"
+  order: 2
+---
+
+Install Docker on every host. Idempotent — re-runs on already-installed hosts are no-ops.
+
+The documented form is the **flat alias** `wheels deploy bootstrap`; `wheels deploy server bootstrap` is equivalent. Older CLI runtimes intercepted the nested `wheels deploy server <verb>` form in the top-level `server` command ([#2677](https://github.com/wheels-dev/wheels/issues/2677)), which is why the flat aliases exist ([#2690](https://github.com/wheels-dev/wheels/pull/2690)). On the current runtime the nested form also reaches deploy dispatch.
+
+## Synopsis
+
+```txt title="synopsis"
+wheels deploy bootstrap [--destination=<name>] [--dry-run]
+```
+
+## Flags
+
+| Flag | Description |
+|------|-------------|
+| `--destination=<name>` | Overlay destination config. |
+| `--dry-run` | Print the commands without executing. |
+
+## Behavior
+
+Per host:
+
+```sh title="per-host behavior"
+which docker >/dev/null 2>&1 || curl -fsSL https://get.docker.com | sh
+```
+
+The convenience script runs as root (or via `sudo`). For production hardening, install Docker through your usual config management instead — this is a fast-start verb, not a production setup.
+
+## Example
+
+```bash title="example"
+wheels deploy bootstrap
+```

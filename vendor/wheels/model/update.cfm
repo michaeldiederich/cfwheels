@@ -120,6 +120,7 @@
 					scale = variables.wheels.class.properties[local.key].scale,
 					null = !Len(arguments.properties[local.key])
 				};
+				local.param.value = $sqliteDateParamValue(value = local.param.value, type = local.param.type, isNull = local.param.null, property = local.key);
 				ArrayAppend(arguments.sql, local.param);
 				if (StructCount(arguments.properties) > local.pos) {
 					ArrayAppend(arguments.sql, ",");
@@ -167,7 +168,7 @@
 	) {
 		$args(name = "updateByKey", args = arguments);
 		$keyLengthCheck(arguments.key);
-		arguments.where = $keyWhereString(values = arguments.key);
+		arguments.where = $keyWhereWithScope(key = arguments.key, where = StructKeyExists(arguments, "where") ? arguments.where : "");
 		StructDelete(arguments, "key");
 		return updateOne(argumentCollection = arguments);
 	}
@@ -203,6 +204,7 @@
 	) {
 		$args(name = "updateOne", args = arguments);
 		local.object = findOne(
+			callbacks = arguments.callbacks,
 			includeSoftDeletes = arguments.includeSoftDeletes,
 			order = arguments.order,
 			reload = arguments.reload,

@@ -33,42 +33,57 @@ component extends="wheels.WheelsTest" {
 					expect(ctx.isIsolatedApplicationName("wheels-dev_wheelsTest")).toBeTrue();
 				});
 
+				// Env-gated (dev/testing) + path anchored to path_info/script_name.
 				it("treats /wheels/core/tests and /wheels/app/tests paths as test context", () => {
 					var ctx = new wheels.events.TestContext();
 					expect(
-						ctx.requestIsTestContext(cgiScope = {path_info = "/wheels/core/tests"})
+						ctx.requestIsTestContext(cgiScope = {path_info = "/wheels/core/tests"}, environment = "development")
 					).toBeTrue();
 					expect(
-						ctx.requestIsTestContext(cgiScope = {script_name = "/index.cfm", path_info = "/wheels/app/tests"})
+						ctx.requestIsTestContext(cgiScope = {script_name = "/index.cfm", path_info = "/wheels/app/tests"}, environment = "testing")
 					).toBeTrue();
+					// env gate: production / unknown fails closed
 					expect(
-						ctx.requestIsTestContext(cgiScope = {query_string = "controller=wheels&view=core/tests"})
-					).toBeFalse("a query string without the runner path is not a test context");
+						ctx.requestIsTestContext(cgiScope = {path_info = "/wheels/core/tests"}, environment = "production")
+					).toBeFalse("the env gate must fail closed in production");
+					// anchored: a runner path outside the request path is not a test context
 					expect(
-						ctx.requestIsTestContext(cgiScope = {path_info = "/", script_name = "/index.cfm"})
+						ctx.requestIsTestContext(cgiScope = {path_info = "/", script_name = "/index.cfm", query_string = "x=/wheels/core/tests"}, environment = "development")
+					).toBeFalse("a runner path outside the request path is not a test context");
+					expect(
+						ctx.requestIsTestContext(cgiScope = {path_info = "/", script_name = "/index.cfm"}, environment = "development")
 					).toBeFalse();
 				});
 
-				it("treats the isolation header or cookie as test context", () => {
+				// The header/cookie now needs the per-process secret + a loopback peer.
+				it("treats the isolation header or cookie as test context only with the secret and a loopback peer", () => {
 					var ctx = new wheels.events.TestContext();
+					var secret = ctx.testSecret();
 					var cgiArgs = {};
-					cgiArgs[ctx.cgiHeaderKey()] = "1";
-					expect(ctx.requestIsTestContext(cgiScope = cgiArgs)).toBeTrue();
+					cgiArgs[ctx.cgiHeaderKey()] = secret;
+					expect(ctx.requestIsTestContext(cgiScope = cgiArgs, environment = "development", expectedSecret = secret, remoteAddr = "127.0.0.1")).toBeTrue();
+					// a bare "1" from loopback is rejected
+					var bad = {};
+					bad[ctx.cgiHeaderKey()] = "1";
+					expect(ctx.requestIsTestContext(cgiScope = bad, environment = "development", expectedSecret = secret, remoteAddr = "127.0.0.1")).toBeFalse();
+					// the secret from a non-loopback peer is rejected
+					expect(ctx.requestIsTestContext(cgiScope = cgiArgs, environment = "development", expectedSecret = secret, remoteAddr = "203.0.113.7")).toBeFalse();
 
 					var cookieArgs = {};
-					cookieArgs[ctx.cookieName()] = "1";
-					expect(ctx.requestIsTestContext(cookieScope = cookieArgs)).toBeTrue();
+					cookieArgs[ctx.cookieName()] = secret;
+					expect(ctx.requestIsTestContext(cookieScope = cookieArgs, environment = "development", expectedSecret = secret, remoteAddr = "::1")).toBeTrue();
 				});
 
 				it("does not treat an empty header or cookie as test context", () => {
 					var ctx = new wheels.events.TestContext();
+					var secret = ctx.testSecret();
 					var cgiArgs = {};
 					cgiArgs[ctx.cgiHeaderKey()] = "";
-					expect(ctx.requestIsTestContext(cgiScope = cgiArgs)).toBeFalse();
+					expect(ctx.requestIsTestContext(cgiScope = cgiArgs, environment = "development", expectedSecret = secret, remoteAddr = "127.0.0.1")).toBeFalse();
 
 					var cookieArgs = {};
 					cookieArgs[ctx.cookieName()] = "";
-					expect(ctx.requestIsTestContext(cookieScope = cookieArgs)).toBeFalse();
+					expect(ctx.requestIsTestContext(cookieScope = cookieArgs, environment = "development", expectedSecret = secret, remoteAddr = "127.0.0.1")).toBeFalse();
 				});
 
 			});
@@ -92,6 +107,7 @@ component extends="wheels.WheelsTest" {
 				});
 
 				it("demo and wheels-new Application.cfc include testcontext.cfm after config/app.cfm", () => {
+					$requireRepoPath("cli/lucli/templates/app/public/Application.cfc");
 					// Resolve the demo app via the /config mapping. Do not walk
 					// GetDirectoryFromPath() on an already-directory path —
 					// a trailing slash is a no-op walk on Lucee, which left
@@ -128,6 +144,51 @@ component extends="wheels.WheelsTest" {
 					);
 					expect(FindNoCase("headerName()", source) > 0 || FindNoCase("X-Wheels-Test-Context", source) > 0).toBeTrue(
 						"WheelsTest.$testClient must send the isolation header so fixture HTTP binds the test application"
+					);
+				});
+
+				// Every sender sends the per-process secret, not a bare "1".
+				it("BrowserTest sends the runner secret in both the header and the cookie fallback", () => {
+					var source = FileRead(ExpandPath("/wheels/wheelstest/BrowserTest.cfc"));
+					expect(FindNoCase("testSecret()", source) > 0).toBeTrue(
+						"BrowserTest must send ctx.testSecret() (header AND cookie fallback)"
+					);
+					// the cookie fallback must send the secret, not a literal "1"
+					expect(FindNoCase("setCookie(name = ctx.cookieName(), value = ctx.testSecret()", source) > 0).toBeTrue(
+						"BrowserTest cookie fallback must send the secret, not a literal 1"
+					);
+				});
+
+				// App-runner fails closed when the test DB is requested but absent.
+				it("app-runner.cfm fails closed when the requested test database is not registered", () => {
+					var source = FileRead(ExpandPath("/wheels/tests/app-runner.cfm"));
+					var helpers = FileRead(ExpandPath("/wheels/global/util.cfm"));
+					// app-runner takes its decision from the shared rule
+					var decidePos = FindNoCase("$testDataSourceDecision(primary = local.originalDataSource, requestUrl = url)", source);
+					expect(decidePos).toBeGT(0, "app-runner must decide with $testDataSourceDecision()");
+					// and refuses (no silent real-DB run) before running anything
+					var window = Mid(source, decidePos, 1500);
+					expect(FindNoCase("local.decision.action == ""refuse""", window) > 0).toBeTrue(
+						"app-runner must refuse when the decision is refuse"
+					);
+					expect(FindNoCase("$testDataSourceRefusal(", window) > 0).toBeTrue();
+					expect(FindNoCase("abort", window) > 0).toBeTrue(
+						"the refusal must abort before running specs against the primary datasource"
+					);
+					expect(FindNoCase('"error" = "Test database not available"', helpers) > 0).toBeTrue();
+					// the shared rule: only an explicit, valid useTestDB=false skips the test DB
+					expect(FindNoCase("if (local.validBoolean && !arguments.requestUrl.useTestDB)", helpers) > 0).toBeTrue(
+						"an omitted useTestDB must default to the test database (false only on explicit valid false)"
+					);
+					// presence is separate from validity: a present-but-invalid value is not omitted
+					expect(FindNoCase("local.paramPresent = StructKeyExists(arguments.requestUrl, ""useTestDB"")", helpers) > 0).toBeTrue(
+						"the rule must track parameter PRESENCE separately from boolean validity"
+					);
+					expect(FindNoCase("allowTestsAgainstPrimaryDatasource", helpers) > 0).toBeTrue(
+						"the omitted-flag path must consult allowTestsAgainstPrimaryDatasource"
+					);
+					expect(FindNoCase("if (!local.paramPresent && local.allowPrimary)", helpers) > 0).toBeTrue(
+						"run-against-primary must require a TRULY-OMITTED flag AND the opt-out setting"
 					);
 				});
 
@@ -176,6 +237,36 @@ component extends="wheels.WheelsTest" {
 					expect(payload.application.name).notToBe(
 						application.applicationName,
 						"live and test requests must use different CFML application names"
+					);
+				});
+
+				// Behaviour proof: a non-secret X-Wheels-Test-Context value (not the
+				// per-process runner secret) must bind the LIVE application.
+				it("a non-secret X-Wheels-Test-Context value binds the live application, not the isolated one", () => {
+					var ctx = new wheels.events.TestContext();
+					var nonSecret = $testClient(testContext = false);
+					nonSecret.withHeader(ctx.headerName(), "1");
+					nonSecret.get(path = "/wheels/info", params = {format = "json"});
+					expect(nonSecret.statusCode()).toBe(200, "live /wheels/info?format=json must be reachable");
+					var payload = nonSecret.json();
+					expect(StructKeyExists(payload, "application") && StructKeyExists(payload.application, "name")).toBeTrue();
+					expect(ctx.isIsolatedApplicationName(payload.application.name)).toBeFalse(
+						"a non-secret `#ctx.headerName()#: 1` (not the runner secret) must bind the LIVE app, not `<name>_wheelsTest` — saw `#payload.application.name#`"
+					);
+				});
+
+				// Behaviour proof: a runner path outside the request path binds the
+				// live application (the trigger is path-anchored).
+				it("a runner path outside the request path binds the live application, not the isolated one", () => {
+					var ctx = new wheels.events.TestContext();
+					var live = $testClient(testContext = false);
+					// Raw in the URL so the slashes arrive un-encoded.
+					live.get(path = "/wheels/info?format=json&x=/wheels/app/tests");
+					expect(live.statusCode()).toBe(200, "live /wheels/info must be reachable");
+					var payload = live.json();
+					expect(StructKeyExists(payload, "application") && StructKeyExists(payload.application, "name")).toBeTrue();
+					expect(ctx.isIsolatedApplicationName(payload.application.name)).toBeFalse(
+						"a `/wheels/app/tests` runner path outside the request path must bind the LIVE app, not `<name>_wheelsTest` — saw `#payload.application.name#`"
 					);
 				});
 

@@ -119,8 +119,18 @@ component output="false" displayName="Model" extends="wheels.Global"{
 		}
 
 		variables.wheels.class.RESQLAs = "[[:space:]]AS[[:space:]][A-Za-z1-9]+";
-		variables.wheels.class.RESQLOperators = "((?:\s+(?:NOT\s+)?LIKE)|(?:\s+(?:NOT\s+)?IN)|(?:\s+IS(?:\s+NOT)?)|(?:<>)|(?:<=)|(?:>=)|(?:!=)|(?:!<)|(?:!>)|=|<|>)";
-		variables.wheels.class.RESQLWhere = "\s*(#variables.wheels.class.RESQLOperators#)\s*(\('.+?'\)|\(((?:\+|-)?[0-9\.],?)+\)|'.+?'()|''|((?:\+|-)?[0-9\.]+)()|NULL)((\s*$|\s*\)|\s+(AND|OR)))";
+		// IS / IS NOT followed by TRUE or FALSE isn't an operator here, so the
+		// predicate stays a SQL literal: "col IS ?" is a syntax error on most
+		// databases (#3896).
+		variables.wheels.class.RESQLOperators = "((?:\s+(?:NOT\s+)?LIKE)|(?:\s+(?:NOT\s+)?IN)|(?:\s+IS(?:\s+NOT)?(?!(?:\s+NOT)?\s+(?:[Tt][Rr][Uu][Ee]|[Ff][Aa][Ll][Ss][Ee])(?![A-Za-z0-9_])))|(?:<>)|(?:<=)|(?:>=)|(?:!=)|(?:!<)|(?:!>)|=|<|>)";
+		// The numeric IN-list branch is a single character class, not a repeated
+		// group: the regex engine recursed once per repeated group, so a list of
+		// a few thousand integers overflowed the stack (#3907).
+		// A quoted value is one masked literal ($maskWhereLiterals leaves no quote inside
+		// it), so it can't run on past its closing quote into the next literal. The value
+		// ends at the end of the clause, a closing parenthesis, AND/OR in any case, or a
+		// LIKE ... ESCAPE clause, which stays in the SQL after the bound value.
+		variables.wheels.class.RESQLWhere = "\s*(#variables.wheels.class.RESQLOperators#)\s*(\('.+?'\)|\(([0-9\.,+-]+)\)|'[^']+'()|''|((?:\+|-)?[0-9\.]+)()|NULL|[Tt][Rr][Uu][Ee]|[Ff][Aa][Ll][Ss][Ee])((\s*$|\s*\)|\s+([Aa][Nn][Dd]|[Oo][Rr])(?![A-Za-z0-9_$])|\s+[Ee][Ss][Cc][Aa][Pp][Ee](?![A-Za-z0-9_$])))";
 		variables.wheels.class.mapping = {};
 		variables.wheels.class.properties = {};
 		variables.wheels.class.accessibleProperties = {};
@@ -317,7 +327,8 @@ component output="false" displayName="Model" extends="wheels.Global"{
 		variables.wheels.class.properties[local.property].type = variables.wheels.class.adapter.$getType(
 			local.type,
 			local.columns["decimal_digits"][local.i],
-			local.details
+			local.details,
+			ListFindNoCase(local.columns.columnList, "column_size") ? local.columns["column_size"][local.i] : ""
 		);
 		variables.wheels.class.properties[local.property].column = local.columnName;
 		variables.wheels.class.properties[local.property].scale = local.columns["decimal_digits"][local.i];
@@ -344,8 +355,15 @@ component output="false" displayName="Model" extends="wheels.Global"{
 		} else {
 			variables.wheels.class.properties[local.property].label = humanize(local.property);
 		}
-		// Detect datetime-like columns for SQLite, without changing the DB type
+		// SQLite date columns the migrator declares as DATE / DATETIME / TIME / TIMESTAMP are
+		// dates for validation (#4093). Binding is unchanged: SQLiteModel maps them as before.
 		if (
+			get("adapterName") eq "SQLiteModel"
+			&& ListFindNoCase("DATE,DATETIME,TIME,TIMESTAMP", variables.wheels.class.properties[local.property].datatype)
+		) {
+			variables.wheels.class.properties[local.property].validationtype = "datetime";
+		// Detect datetime-like TEXT columns for SQLite (apps created before #4093), without changing the DB type
+		} else if (
 			variables.wheels.class.properties[local.property].datatype eq "TEXT"
 			&& variables.wheels.class.properties[local.property].type eq "cf_sql_varchar"
 			&& ReFindNoCase("\b(date|time|dob|birthday|birthTime|created|updated)\b", variables.wheels.class.properties[local.property].column)

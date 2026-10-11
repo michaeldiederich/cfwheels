@@ -108,7 +108,19 @@ component {
 	 * Internal function.
 	 */
 	public function $setAuthenticityToken() {
-		if (!$isVerifiedRequest() && isAjax()) {
+		// The X-CSRF-Token header counts on any non-GET request, not only with
+		// X-Requested-With (#3959). The token value is the protection: a cross-site
+		// page can't read it, and X-Requested-With is itself a custom header with the
+		// same CORS preflight. Clients that send the page's current token in this
+		// header (Turbo, or a fetch() that sets it) don't send X-Requested-With. With
+		// startFormTag/buttonTo(authenticityToken = false), this is how a form in
+		// shared cached markup (which must not carry a token) takes the token at
+		// request time.
+		//
+		// Rule when both are present: the request passes if EITHER the form field or
+		// the header holds a valid token (Rails' behaviour). The header is consulted
+		// only when the field didn't verify.
+		if (!$isVerifiedRequest()) {
 			if (StructKeyExists(request.$wheelsHeaders, "X-CSRF-Token")) {
 				params.authenticityToken = request.$wheelsHeaders["X-CSRF-Token"];
 			}
@@ -128,7 +140,13 @@ component {
 	public boolean function $isAnyAuthenticityTokenValid() {
 		if ($isRequestProtectedFromForgery() && StructKeyExists(params, "authenticityToken")) {
 			if (application.wheels.csrfStore == "session") {
-				local.isValid = CsrfVerifyToken(params.authenticityToken);
+				// Exact, case-sensitive and constant-time on every engine, the same way the
+				// cookie store compares: the value must equal the session token
+				// (CsrfGenerateToken() returns the current one; the form field uses it too).
+				local.sessionToken = CsrfGenerateToken();
+				local.isValid = Len(local.sessionToken)
+					&& IsSimpleValue(params.authenticityToken)
+					&& $secureCompare(local.sessionToken, params.authenticityToken);
 			} else {
 				local.isValid = $isCookieAuthenticityTokenValid();
 			}
@@ -200,11 +218,13 @@ component {
 			// transformation string ("AES/GCM/NoPadding"), so strip mode/padding.
 			local.authenticityToken = GenerateSecretKey(ListFirst(application.wheels.csrfCookieEncryptionAlgorithm, "/"));
 			local.value = SerializeJSON({sessionId = CreateUUID(), authenticityToken = local.authenticityToken});
-			local.value = Encrypt(
-				local.value,
-				local.encryptionKey,
-				application.wheels.csrfCookieEncryptionAlgorithm,
-				application.wheels.csrfCookieEncryptionEncoding
+			local.value = $csrfCookieTransportValue(
+				Encrypt(
+					local.value,
+					local.encryptionKey,
+					application.wheels.csrfCookieEncryptionAlgorithm,
+					application.wheels.csrfCookieEncryptionEncoding
+				)
 			);
 
 			if (application.wheels.csrfStore == "cookie") {
@@ -221,6 +241,21 @@ component {
 
 	/**
 	 * Internal function.
+	 * The CSRF cookie's value as read from the cookie scope. When this request set the
+	 * cookie (cookie[name] = {value, httpOnly, ...}), Lucee, Adobe and BoxLang read it
+	 * back as its value, but RustCFML returns the struct that was assigned, so take its
+	 * value. Anything else that isn't a string reads as no cookie ("").
+	 */
+	public string function $csrfCookieScopeValue(required any raw) {
+		local.rv = arguments.raw;
+		if (IsStruct(local.rv) && StructKeyExists(local.rv, "value")) {
+			local.rv = local.rv.value;
+		}
+		return IsSimpleValue(local.rv) ? local.rv : "";
+	}
+
+	/**
+	 * Internal function.
 	 */
 	public string function $readAuthenticityTokenFromCookie() {
 		local.cookieName = application.wheels.csrfCookieName;
@@ -231,7 +266,10 @@ component {
 		}
 
 		// Cookie is there. Read it in.
-		local.cookie = cookie[local.cookieName];
+		local.cookieValue = $csrfCookieScopeValue(cookie[local.cookieName]);
+		if (!Len(local.cookieValue)) {
+			return "";
+		}
 
 		try {
 			local.encryptionKey = $ensureCsrfCookieEncryptionKey();
@@ -240,7 +278,7 @@ component {
 			return "";
 		}
 
-		local.cookieAttrs = $decryptCsrfCookieValue(local.cookie, local.encryptionKey);
+		local.cookieAttrs = $decryptCsrfCookieValue(local.cookieValue, local.encryptionKey);
 
 		// When cookie is corrupted (or encrypted with an unknown key/algorithm), fail.
 		if (!Len(local.cookieAttrs)) {
@@ -255,12 +293,46 @@ component {
 		// Now we have everything we need, deserialize.
 		local.cookieAttrs = DeserializeJSON(local.cookieAttrs);
 
-		// Check to make sure the JSON we decoded has the authenticity token in it.
-		if (!StructKeyExists(local.cookieAttrs, "authenticityToken")) {
+		// Check to make sure the JSON we decoded is the payload, with the authenticity token in it.
+		if (!IsStruct(local.cookieAttrs) || !StructKeyExists(local.cookieAttrs, "authenticityToken")) {
 			return "";
 		}
 
 		return local.cookieAttrs.authenticityToken;
+	}
+
+	/**
+	 * Internal function.
+	 * The cookie's ciphertext in the base64url alphabet ("-" and "_" for "+" and "/", no
+	 * "=" padding), when the configured encoding is Base64. Nothing in such a value needs
+	 * encoding in a cookie. A value whose only encoded character is %2B reads back with the
+	 * "+" turned into a space on some engines (Lucee 7.0.1 behind Tomcat), so about 3% of
+	 * standard-base64 cookies could not be decrypted and the next POST was refused.
+	 */
+	public string function $csrfCookieTransportValue(required string cipherText) {
+		if (CompareNoCase(application.wheels.csrfCookieEncryptionEncoding, "Base64") != 0) {
+			return arguments.cipherText;
+		}
+		local.rv = Replace(Replace(arguments.cipherText, "+", "-", "all"), "/", "_", "all");
+		return ReReplace(local.rv, "=+$", "");
+	}
+
+	/**
+	 * Internal function.
+	 * The standard-base64 ciphertext for a cookie value: base64url turned back, padding
+	 * restored, and a space (never valid base64, so a "+" the engine decoded) turned back
+	 * into "+". A cookie written as standard base64 before this change passes through.
+	 */
+	public string function $csrfCookieCipherText(required string cookieValue) {
+		if (CompareNoCase(application.wheels.csrfCookieEncryptionEncoding, "Base64") != 0) {
+			return arguments.cookieValue;
+		}
+		local.rv = Replace(Replace(Replace(arguments.cookieValue, "-", "+", "all"), "_", "/", "all"), " ", "+", "all");
+		local.remainder = Len(local.rv) % 4;
+		if (local.remainder > 0) {
+			local.rv &= RepeatString("=", 4 - local.remainder);
+		}
+		return local.rv;
 	}
 
 	/**
@@ -276,10 +348,11 @@ component {
 		// do not persist after the catch on BoxLang.
 		local.state = {decrypted = ""};
 		local.legacyAvailable = application.wheels.csrfCookieEncryptionAlgorithm != "AES";
+		local.cipherText = $csrfCookieCipherText(arguments.encryptedValue);
 
 		try {
 			local.state.decrypted = Decrypt(
-				arguments.encryptedValue,
+				local.cipherText,
 				arguments.encryptionKey,
 				application.wheels.csrfCookieEncryptionAlgorithm,
 				application.wheels.csrfCookieEncryptionEncoding
@@ -303,7 +376,7 @@ component {
 		if (local.legacyAvailable && !$isCsrfCookiePayload(local.state.decrypted)) {
 			try {
 				local.legacyDecrypted = Decrypt(
-					arguments.encryptedValue,
+					local.cipherText,
 					arguments.encryptionKey,
 					"AES",
 					application.wheels.csrfCookieEncryptionEncoding
@@ -332,7 +405,23 @@ component {
 	 * assumption about it. The caller re-checks the same thing before deserializing.
 	 */
 	public boolean function $isCsrfCookiePayload(required string value) {
-		return Len(arguments.value) > 0 && IsJSON(arguments.value);
+		if (!Len(arguments.value) || !IsJSON(arguments.value)) {
+			return false;
+		}
+		// A wrong-algorithm decrypt can also return garbage that happens to parse as JSON (a
+		// number, say), so the payload has to be the struct the cookie writes, with a token.
+		var parsed = {ok = false, value = ""};
+		try {
+			parsed.value = DeserializeJSON(arguments.value);
+			parsed.ok = true;
+		} catch (any e) {
+			parsed.ok = false;
+		}
+		return parsed.ok
+			&& IsStruct(parsed.value)
+			&& StructKeyExists(parsed.value, "authenticityToken")
+			&& IsSimpleValue(parsed.value.authenticityToken)
+			&& Len(parsed.value.authenticityToken) > 0;
 	}
 
 	/**
@@ -341,11 +430,18 @@ component {
 	public struct function $csrfCookieAttributeCollection(required string value) {
 		local.cookieStruct = {
 			value = arguments.value,
-			encodeValue = application.wheels.csrfCookieEncodeValue,
 			httpOnly = application.wheels.csrfCookieHttpOnly,
-			preserveCase = application.wheels.csrfCookiePreserveCase,
 			secure = application.wheels.csrfCookieSecure
 		};
+		// encodeValue and preserveCase default to "" (the engine's own default).
+		// Only set them when configured: Adobe CF rejects "" for these boolean
+		// cookie attributes, so the first cookie-store token was an HTTP 500.
+		if (Len(application.wheels.csrfCookieEncodeValue)) {
+			local.cookieStruct.encodeValue = application.wheels.csrfCookieEncodeValue;
+		}
+		if (Len(application.wheels.csrfCookiePreserveCase)) {
+			local.cookieStruct.preserveCase = application.wheels.csrfCookiePreserveCase;
+		}
 		if (Len(application.wheels.csrfCookieSameSite)) {
 			local.cookieStruct.sameSite = application.wheels.csrfCookieSameSite;
 		}

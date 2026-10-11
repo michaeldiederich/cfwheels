@@ -1,0 +1,40 @@
+---
+title: "wheels deploy server exec"
+description: Run an arbitrary command on every host (or one filtered host).
+type: reference
+sidebar:
+  label: "exec"
+  order: 1
+---
+
+Run a command on every host. Filter to one host with `--host=`.
+
+The documented form is the **flat alias** `wheels deploy exec`; `wheels deploy server exec` is equivalent. Older CLI runtimes intercepted the nested `wheels deploy server <verb>` form in the top-level `server` command ([#2677](https://github.com/wheels-dev/wheels/issues/2677)), which is why the flat aliases exist ([#2690](https://github.com/wheels-dev/wheels/pull/2690)). On the current runtime the nested form also reaches deploy dispatch.
+
+## Synopsis
+
+```txt title="
+wheels deploy exec <command> [--host=<host>] [--destination=<name>] [--dry-run]
+```
+
+## Arguments and flags
+
+| Argument / flag | Description |
+|------|-------------|
+| `<command>` | **Required positional.** Shell command to run remotely. Every positional token after `exec` is joined into one command, so quoting is optional for simple commands — still quote anything with shell metacharacters (pipes, redirects) so your local shell does not interpret them first. Without it, the command fails with `wheels deploy exec requires a command` and exit code 1. There is no `--cmd=` flag (the parser ignores it). |
+| `--host=<host>` | Limit to one host. Must match a host declared in `deploy.yml` — throws `DeployServerCli.UnknownHost` otherwise. |
+| `--destination=<name>` | Overlay destination config. |
+| `--dry-run` | Print the command without executing. |
+
+## Behavior
+
+SSHes in parallel (or to one host) and runs the command verbatim. Output is prefixed by host.
+
+Useful for smoke-testing connectivity, reading environment details, or running one-off diagnostic commands without writing a hook.
+
+## Example
+
+```bash title="illustrative — requires live SSH hosts"
+wheels deploy exec uptime
+wheels deploy exec "docker ps" --host=192.0.2.10
+```

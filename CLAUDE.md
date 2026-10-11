@@ -85,7 +85,18 @@ The framework must run on Lucee 5/6/7, Adobe CF 2018/2021/2023/2025, and BoxLang
 
     **16b-ext — a closure whose first two statements are a zero-arg `$`-member call then an argumented `$`-member call, Adobe 2025.** The same `MissingNameException` fires when a closure body *opens* with `_controller.$clearCachableActions()` followed by `g.$clearCache("action")` (any receivers — local, `g = application.wo`, or `application.wo` itself). Probe-verified boundaries: the pair compiles when it is **not** the first two statements (an assignment, an argumented call, or even another zero-arg call before it rescues it), when the first call has arguments, when the first call is not `$`-prefixed (`_controller.flashClear()` then `_controller.$setFlashStorage("x")` compiles), or when the second call is zero-arg. Fix by reordering (`g.$clearCache("action")` first) or hoisting a `var`/assignment ahead of the pair. Hit by `ControllerHardenerSpec` / `ControllerHardenerShouldSpec` `afterEach` blocks (the Aug 28 matrix dispatch showed the whole adobe2025 leg at `tests="0"`).
 
-    Bisect this class of bug with a single probe against a running container instead of CI (~13s vs ~19min):
+    **16c — a quoted-string named argument in a direct call, Adobe 2023 ONLY.** `obj.method("name" = value)` — a named argument whose *name* is a quoted string literal, in a direct method/function call — is a compile error on **Adobe CF 2023** (`MissingNameException`), but compiles on Lucee 6/7, BoxLang, **and Adobe 2025**. This is the inverse footprint of its siblings: 16a fails both Adobe engines, 16b/16b-ext are Adobe 2025 only, and this one is the lone **2023-only** shape — so an adobe2025-green smoke does NOT cover it. **Unlike the closure-sensitive 16b-ext, this trap is context-independent** — probe-verified on adobe2023/62023, it fails identically in all four call contexts tested: a single-expression arrow (`(x) => obj.method("n" = x)`), a block-bodied arrow, a regular `function()` closure, and a plain statement in a non-closure method body. The trigger is specifically a `"string"` name needed for a `$`-prefixed or hyphenated argument. Measured boundaries that compile on adobe2023 (do **not** "fix" them): an *unquoted* named argument (`name = value`), a quoted *struct-literal* key (`{"$x" = 1}` — it is a struct key, not a function-argument name), and the `argumentCollection` workaround below. Like the others, Adobe blames the enclosing `describe(...)` / `function` line, and one occurrence zeroes the **entire adobe2023 leg** (`tests="0"` on every database) because the core suite compiles via `directory=`. Fix: build the arguments in a struct and pass them through `argumentCollection`, which sidesteps argument-name parsing and is byte-identical in effect:
+    ```cfm
+    // WRONG — MissingNameException on adobe2023 (green on Lucee/BoxLang/adobe2025)
+    var out = c.URLFor(controller = "posts", action = "index", "$argsResolved" = true);
+    // RIGHT — the $-prefixed name lives on a struct key, not an argument name
+    var args = {controller = "posts", action = "index"};
+    args["$argsResolved"] = true;
+    var out = c.URLFor(argumentCollection = args);
+    ```
+    Hit by `linkToUrlForDifferentialSpec` ([#4192](https://github.com/wheels-dev/wheels/pull/4192)); it was pre-existing and only the adobe2023 matrix legs caught it (Lucee-only local verification did not).
+
+    Bisect this class of bug with a single probe against a running container instead of CI (~13s vs ~19min) — use the engine's own port (`62025` for the Adobe 2025 shapes above, `62023` for the 16c Adobe 2023 shape):
     ```bash
     curl -s "http://localhost:62025/wheels/core/tests?db=sqlite&format=json&cli=true" | \
       python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('totalPass','COMPILE FAIL'), d.get('RootCause',{}).get('snippet',''))"
@@ -142,6 +153,25 @@ The framework must run on Lucee 5/6/7, Adobe CF 2018/2021/2023/2025, and BoxLang
 20. **BoxLang's `DirectoryList()` returns a fixed-size array — `ArrayAppend` on it throws with NO message.** The exception surfaces as an `Error`-status spec with an empty `failMessage`/`failDetail`, and TestBox blames the closure's first line rather than the append. Copy into a fresh array before appending: `var files = []; for (var f in DirectoryList(...)) { ArrayAppend(files, f); }`. Iterating the result directly (`for (var f in DirectoryList(...))`) is fine. Hit by `BareCfabortGuardSpec` (Aug 29 matrix dispatch — BoxLang mysql+sqlite legs). Also note BoxLang's loose `==` coerces boolean-ish strings numerically — `"1" == "yes"` and `"0" == "no"` are TRUE, and `ListFindNoCase("yes,no", "1")` returns 1 / `("yes,no", "0")` returns 2 for the same reason. Use `CompareNoCase(a, b) == 0` (or `Compare`) for string equality decisions; hit by `QuoteValueSpec`.
 
 21. **On Adobe CF, a mixin UDF that creates a subclass whose pseudo-constructor copies that same UDF onto `this` fails the first time per JVM.** Adobe CF 2023 and 2025 (Lucee and BoxLang are fine): the call's epilogue pops a super scope its prologue never pushed, so it throws `java.util.EmptyStackException` (or a `NullPointerException` on `this.SymTab_superScopes`) at `NeoPageContext.popSuperScope`. The call's own body completes normally. In Wheels, `application.wo` (a plain `wheels.Global`) runs the `global/objects.cfm` mixin `$createObjectFromRoot` to create `wheels.Public`, and Global's pseudo-constructor (`$promoteIncludedGlobalsToThis()`) copies `$createObjectFromRoot` onto the new object. That made **the first request after every cold start** a 500 at the `Public` line in `onapplicationstart.cfc` ([#3730](https://github.com/wheels-dev/wheels/issues/3730)). Any earlier request absorbs the one-time failure, including the Docker healthcheck `GET /` or a readiness retry. That is why the test suite and CI never see it, and why 51edf9dce "fixed" the wrong thing (a Public.$init include nest). Fix: create **any** Global subclass outside a mixin call first, which initializes the engine state for every Global mixin. `onapplicationstart.$init()` creates `wheels.events.SuperScopePrimer` as its first statement; keep it first, and keep the primer empty. Guard: `vendor/wheels/tests/specs/events/SuperScopePrimerSpec.cfc` (structural, because the state is once per JVM). Verify a change in this area with a **cold first request, healthcheck disabled**, never the suite. CI runs exactly that on every engine in `.github/workflows/cold-start-smoke.yml` (`tools/ci/cold-start-smoke.sh`, #3735). Deep reference: [.ai/wheels/cross-engine-compatibility.md](.ai/wheels/cross-engine-compatibility.md).
+
+22. **On BoxLang, a request that ends with `abort` skips any `finally` whose `try` has a `catch` clause — even an unreached `catch (any) { rethrow; }`.** A catch-free `try/finally` runs, and so does one whose finally issues a `transaction action=` statement; whether the try or finally contains a transaction action makes no difference, the catch clause alone decides. Lucee 6/7 and Adobe run the finally either way, so **local Lucee and Adobe green do NOT cover this**. Keep must-run cleanup (a lock release, the rollback of a transaction on abort) in a catch-free `try/finally`; to still tell a normal throw from an abort, nest a `try/catch` that sets a flag inside it:
+    ```cfm
+    var exitState = {completed = false, threw = false};
+    try {
+        try {
+            doWork();
+            exitState.completed = true;
+        } catch (any e) {
+            exitState.threw = true;
+            rethrow;
+        }
+    } finally {
+        if (!exitState.completed && !exitState.threw) {
+            // only an abort gets here: run the must-run cleanup
+        }
+    }
+    ```
+    Hit twice: the session-lock release in `withAdvisoryLock(transaction = true)` ([#4330](https://github.com/wheels-dev/wheels/pull/4330)), and `invokeWithTransaction()`, whose rollback lived in the finally of a try with a catch, so on BoxLang an abort inside it kept the writes made before the abort (`$invokeTransactionMethod()` in `vendor/wheels/model/transactions.cfm`).
 
 Verify Adobe CF fixes locally before pushing — don't iterate via CI:
 ```bash
@@ -352,7 +382,7 @@ For new migrator helpers or anywhere you accept a column-name argument: declare 
 
 Association foreign-key defaults resolve **either** convention: the default derivation checks which column actually exists on whichever side owns the foreign key, rather than reading the setting ([#3337](https://github.com/wheels-dev/wheels/issues/3337) — before that fix the model layer derived `<modelName><key>` unconditionally and a stock `wheels new` app threw `key [<name>id] doesn't exist` on any `include=`). It is schema-driven on purpose: the migrator reads the flag per call, but the model-side default is memoized for the application lifetime, so honouring the flag there would let a runtime flip change migrations without changing models. Apps holding a mix of both shapes work for the same reason.
 
-**Polymorphic associations are not covered.** `belongsTo(polymorphic=true)` and `hasMany`/`hasOne` with `as=` fix their foreign key to `<name>id` at *registration* time (`vendor/wheels/model/associations.cfm:30`, `:81`, `:134`), before the schema is available, so the join-time resolution never sees a blank to fill. Against an underscore-shaped schema those still need an explicit `foreignKey="<name>_id"`.
+**Polymorphic associations resolve the same way** ([#4457](https://github.com/wheels-dev/wheels/pull/4457)). `belongsTo(polymorphic=true)` and `hasMany`/`hasOne` with `as=` record which of `foreignKey` / `foreignType` they *derived* at registration (`$derivedPolymorphicColumns`). On first use, `$resolvePolymorphicColumns()` (`vendor/wheels/model/associations.cfm`) checks the derived names against the child's table: `<name>id` / `<name>type` when they exist, otherwise `<name>_id` / `<name>_type`. The forms without an underscore win when both exist. Names passed explicitly are kept as given, and `foreignType=` ([#4398](https://github.com/wheels-dev/wheels/pull/4398)) names a type column that matches neither convention.
 
 ## Wheels Conventions
 
@@ -385,7 +415,7 @@ component extends="wheels.WheelsTest" {
 - **App tests**: `/wheels/app/tests` — project-specific, in `tests/specs/`. Uses `tests/populate.cfm` and `tests/TestRunner.cfc`.
 - **Core tests**: `/wheels/core/tests` — framework, in `vendor/wheels/tests/specs/`. Uses `vendor/wheels/tests/populate.cfm`. **This is what CI runs across all engines × DBs.**
 
-**Isolated test application (#3374):** `Application.cfc` includes `vendor/wheels/events/testcontext.cfm` after `config/app.cfm` so runner URLs (and TestClient/browser requests that send `X-Wheels-Test-Context`) bind `<this.name>_wheelsTest` — a separate CFML application scope. The live `application.wheels` is not swapped. `$testClient(testContext=false)` addresses the live app. A request-scoped overlay cannot replace this (blockers B1–B9 on #3025). Existing apps without the include still use the #3373 named-lock swap on the live scope.
+**Isolated test application (#3374):** `Application.cfc` includes `vendor/wheels/events/testcontext.cfm` after `config/app.cfm` so runner URLs (and browser requests carrying the per-process runner secret) bind `<this.name>_wheelsTest` — a separate CFML application scope. The live `application.wheels` is not swapped. `$testClient(testContext=false)` addresses the live app. A request-scoped overlay cannot replace this (blockers B1–B9 on #3025). Existing apps without the include still use the #3373 named-lock swap on the live scope. **Gated:** the switch is honoured only when `WHEELS_ENV` ∈ {development, testing}; the runner path is matched against `path_info`/`script_name`; the `X-Wheels-Test-Context` header/cookie must equal the per-process `server.$wheelsTestContextSecret` from a loopback `cgi.remote_addr`. The authoritative teeth is a fail-closed backstop in `events/onapplicationstart.cfc` that refuses a `_wheelsTest` start whenever the config-resolved environment is not development/testing, before any start-up side effect; the runners also refuse to run in production and `/wheels/app/tests` defaults to the `_test` DB. The core suite therefore needs `WHEELS_ENV=development` (set in `compose.yml` and `tools/test-local.sh`); without it the runner falls back to the live scope and logs an isolation-off warning.
 
 **Critical**: core tests use `directory="wheels.tests.specs"` which compiles EVERY CFC in the directory. One compilation error in any spec file crashes the entire suite for that engine. The "inline closure as constructor named arg" anti-pattern (#5 in Cross-Engine Invariants) is the classic example.
 
@@ -393,7 +423,11 @@ component extends="wheels.WheelsTest" {
 
 - **Test infra scope**: Wheels internals (`$dbinfo`, `model()`, etc.) aren't available as bare calls in `.cfm` files included from plain CFCs like `TestRunner.cfc`. Use `application.wo.model()` or native CFML tags (`cfdbinfo`).
 - **`#` escape**: HTML entities like `&#111;` contain `#` which CFML interprets as expression delimiter. In string literals, escape: `&##111;`. Comments (`//`) are fine. Unescaped `#` in strings crashes the **entire** test suite, not just that file.
-- **`$clearRoutes()` in test specs**: NOT inherited from `wheels.WheelsTest`. Copy from `linksSpec.cfc` if your spec manipulates routes.
+- **Route-state save/restore in test specs**: `wheels.WheelsTest` provides `$snapshotRoutes()`, `$restoreRoutes(snapshot)`, and `$clearRoutes()` ([#4194](https://github.com/wheels-dev/wheels/issues/4194)). Any spec that redefines the route table MUST snapshot in `beforeEach` and restore in `afterEach`, or it leaks stale state into later specs (routes, staticRoutes, namedRoutePositions, the urlFor caches, and #4183's index are all separate — a partial restore is the #4192 bug class). Use the helpers rather than hand-rolling the save/restore:
+  ```cfm
+  beforeEach(() => { variables._routes = $snapshotRoutes(); $clearRoutes(); g.mapper()...end(); g.$setNamedRoutePositions(); });
+  afterEach(() => $restoreRoutes(variables._routes));
+  ```
 
 ### Running tests locally
 
@@ -438,7 +472,9 @@ Specs extend `wheels.wheelstest.BrowserTest`. Install Playwright once: `wheels b
 The user-facing quick references — Model, Routing, Pagination helpers,
 Middleware, DI container, Package system + CLI, Migrations & Seeding,
 Background Jobs, SSE, and app testing — live in
-`docs/consumer-ai/CLAUDE.md`, which ships in every distributed artifact
+`docs/consumer-ai/CLAUDE.md` (conventions, common mistakes, testing and a
+topic index, kept under 8 KB) and `docs/consumer-ai/.ai/<topic>.md`
+(the reference topics), which ship in every distributed artifact
 (ForgeBox core, starter app, `wheels new` scaffolds) and is what AI tools
 inside USER apps auto-load. Keep both files in sync: when a quick
 reference changes here, update the consumer copy (or run
@@ -480,7 +516,7 @@ User-facing `fix`/`feat` PRs add a **fragment file**, never a direct `CHANGELOG.
 Run `wheels setup agents` to write `.mcp.json` and `.opencode.json` in the current project (it merges, preserving any other servers you already list). It is `setup agents`, not `setup mcp`: LuCLI intercepts the literal token `mcp` in **any** argument position
 (`wheels info mcp` is intercepted too), so no argument may be spelled `mcp`. `setup agents` avoids the token entirely — see the MCP integration guide for OpenCode/Cursor variants.
 
-Tools are auto-discovered from `cli/lucli/Module.cfc` public functions. Names in `tools/list` are the bare function names — NOT `wheels_*`-prefixed (verified by a stdio `tools/list` against the source module): `analyze`, `create`, `db`, `destroy`, `doctor`, `generate`, `info`, `migrate`, `notes`, `packages`, `reload`, `routes`, `seed`, `stats`, `test`, `upgrade`, `validate` (17 tools; the `wheels` server entry in `.mcp.json` namespaces them per client). CLI-only, stateful, and side-effecting commands (`main`, `mcp`, `setup`, `d`, `g`, `new`, `console`, `start`, `stop`, `engines`, `browser`, `jobs`, `coverage`, `docs`, `deploy`, …) are hidden via `mcpHiddenTools()`, which also auto-hides every public `$`-prefixed helper — read that function for the current list.
+Tools are auto-discovered from `cli/lucli/Module.cfc` public functions. Names in `tools/list` are the bare function names — NOT `wheels_*`-prefixed (verified by a stdio `tools/list` against the source module): `analyze`, `db`, `destroy`, `doctor`, `generate`, `info`, `lookup`, `migrate`, `notes`, `packages`, `reload`, `routes`, `seed`, `stats`, `test`, `upgrade`, `validate` (17 tools; the `wheels` server entry in `.mcp.json` namespaces them per client). CLI-only, stateful, and side-effecting commands (`main`, `mcp`, `setup`, `d`, `g`, `new`, `create`, `console`, `start`, `stop`, `engines`, `browser`, `jobs`, `coverage`, `docs`, `deploy`, …) are hidden via `mcpHiddenTools()`, which also auto-hides every public `$`-prefixed helper — read that function for the current list.
 
 **Deprecated:** the in-dev-server HTTP endpoint at `/wheels/mcp`. Emits a deprecation notice on first request. Migrate to the stdio surface.
 

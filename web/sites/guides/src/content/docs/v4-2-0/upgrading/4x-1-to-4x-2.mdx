@@ -1,0 +1,571 @@
+---
+title: Upgrading from 4.1 to 4.2
+description: The 4.1 → 4.2 upgrade is a framework swap plus a few edits to app-owned files (public/Application.cfc, config/environment.cfm, app/events); this is the checklist, with each change's issue and whether skipping it fails safe, and the behaviour changes to check.
+type: howto
+sidebar:
+  order: 1
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+Upgrading from any 4.1.x to 4.2 is the same `vendor/wheels/` swap as a patch upgrade (see [Manual upgrades](/v4-2-0/upgrading/manual-upgrades/)). What the swap does **not** do for you is update the files `wheels new` created once and then handed to you: `public/Application.cfc`, `config/environment.cfm`, `config/settings.cfm` and the `app/events/*.cfm` templates. Framework updates never reach them. This page lists each of those edits with the issue it came from and whether skipping it fails safe, then the behaviour changes worth checking in your code.
+
+<Aside type="tip" title="The fastest way to find the drift">
+Upgrade the CLI first (step 1 below), then run `wheels upgrade check --to=4.2.0` on a workstation. It diffs `public/Application.cfc` and `public/index.cfm` against the template bundled with the CLI, names each `public/Application.cfc` edit on this page (and in the 4.0 to 4.1 guide) that your copy is missing, and flags known code patterns. A 4.1 CLI compares against its own 4.1 template, so it reports no drift even when the 4.2 edits below are missing. For the other app-owned files, compare against a fresh `wheels new` app made with the 4.2 CLI. The template is the authority; keep your local customizations.
+</Aside>
+
+## Swap the framework
+
+<Steps>
+
+1. **Upgrade the `wheels` CLI to 4.2.** See [Upgrading](/v4-2-0/start-here/installing/#upgrading) (`brew upgrade wheels`, `scoop update wheels`, `apt upgrade wheels` or `dnf upgrade wheels`). The steps below rely on it: `wheels upgrade check --to=4.2.0` and a fresh `wheels new` app only show the 4.2 files when the CLI is 4.2, and the dev-server changes under [CLI and deployment changes](#cli-and-deployment-changes) come with the CLI, not with `vendor/wheels/`.
+
+2. **Swap the framework: `wheels upgrade apply` does steps 2 and 3 for you.** Run it from the app root (after `wheels upgrade check --to=4.2.0`): it moves the current `vendor/wheels/` to `.wheels/backups/wheels.bak-<timestamp>/`, outside `vendor/`, copies in the framework bundled with your 4.2 CLI, updates `box.json`'s `wheels-core` version if the app has one, and prints the one-line command that rolls it back. Then continue with step 4. To do it by hand instead:
+
+   **Back up the current framework outside `vendor/`.** Move (don't delete) `vendor/wheels/` out of the project, e.g. to `../wheels-4.1.x.bak/`. Moving it back is the whole rollback. Don't leave the backup inside `vendor/`: 4.2 loads every folder there as a package, so a `vendor/wheels-4.1.x.bak/` logs a "skipped: unsafe directory name" error on every start, and [committing `vendor/`](#commit-vendor-420) would commit it.
+
+3. **Install 4.2.x.** Extract the 4.2 `vendor/wheels/` in its place (or `git checkout` the tag if you vendor the framework). If the app is managed with CommandBox (its `box.json` lists `wheels-core` under `dependencies`), set that version to 4.2 as well, for example `"wheels-core": "^4.2.0"`: left at 4.1, the next `box install` copies the 4.1 framework back over `vendor/wheels/` without clearing it. `wheels upgrade apply` updates it for you.
+
+4. **Restart the server and run your suite.** Use `wheels stop` then `wheels start`, and `/wheels/app/tests`. The suite now runs against a separate `<datasource>_test` datasource and refuses to run without one; see [App tests use the test database](#app-tests-use-the-test-database-and-test-application). Then apply the edits below, and restart again after them: `?reload=true` rebuilds the application but doesn't recompile changed `app/events/*.cfm` or `public/Application.cfc` files on a running dev server.
+
+</Steps>
+
+## Edits to app-owned files
+
+"Fails safe if skipped" means the app keeps working correctly without the edit. Where it does **not**, the consequence is stated.
+
+### `config/environment.cfm` reads `WHEELS_ENV` (4.2.0)
+
+Apps generated before 4.2 hardcode the environment: `config/environment.cfm` contains `set(environment="development")`, so a `WHEELS_ENV=production` set by a Docker image, systemd unit or host has no effect ([#3946](https://github.com/wheels-dev/wheels/issues/3946)). The 4.2 template reads `WHEELS_ENV` through `env()` (`.env` first, then the process environment). Unset or empty means `development`. Any value other than `development`, `testing`, `maintenance` or `production` stops the app at startup with `Wheels.InvalidEnvironment`, because Wheels shows error details in any environment that isn't `production`.
+
+If your `config/environment.cfm` chooses the environment some other way (for example `set(environment=application.env.environment)`, or a lookup by host name), keep that selection when you adopt the template: set `WHEELS_ENV` on every server before replacing the file, or carry your selection logic into the new file. Replacing the file outright drops your selection, and a server without `WHEELS_ENV` then starts in `development`.
+
+Replace `config/environment.cfm` with the one from a fresh `wheels new` app (see [Environments and Configuration](/v4-2-0/core-concepts/environments-and-configuration/)), or keep yours and hardcode `set(environment="production");` on production servers.
+
+A `WHEELS_ENV` line in `.env` wins over the process environment, and `wheels new` writes `WHEELS_ENV=development` into `.env` (and `.env.example`). So on a production server, or in an image that carries the app's `.env`, remove that line or set it to `production`; otherwise `WHEELS_ENV=production` from the host has no effect.
+
+Two related template changes are optional:
+- The template's `config/settings.cfm` reads the datasource name the same way: `set(dataSourceName=env("WHEELS_DATASOURCE", "<app name>"))`. Copy it if you want to choose the datasource per server; an app that keeps `set(dataSourceName="…")` works as before.
+- New apps ship `config/development/settings.cfm`, `config/testing/settings.cfm`, `config/maintenance/settings.cfm` and `config/production/settings.cfm` with only comments. They run after `config/settings.cfm` in that environment; add them only when you have per-environment settings.
+
+**Does not fail safe:** an app deployed with only `WHEELS_ENV=production` set keeps running in development mode, with full error details shown to visitors.
+
+### `onError` running-app message (4.2.0)
+
+The `onError` minimal fallback now tells an error raised once the application is already running (for example a request timeout after startup) apart from a genuine startup failure, and extends the request timeout before logging, so the `wheels.log` entry it points at is actually written ([#3965](https://github.com/wheels-dev/wheels/issues/3965)).
+
+**Fails safe:** the old version shows a misleading "Wheels failed to initialize" page and may not write the log entry, but the app is otherwise unaffected. Copy the updated `onError`, `$renderMinimalError` and `$logStartupFailure` functions from the template into your `public/Application.cfc`, replacing the existing versions.
+
+### Reload-password header fallback (4.2.0)
+
+`public/Application.cfc` now falls back to the raw request headers (`GetHttpRequestData()`) when the `cgi` copy of `X-Wheels-Reload-Password` is missing, which happens on RustCFML for the first request after a restart ([#3913](https://github.com/wheels-dev/wheels/issues/3913)). The password stays header-only, and the reload gate, its rate limit and its constant-time comparison are framework code and unchanged.
+
+**Fails safe:** without it, `wheels reload` against a RustCFML server fails every other run; Lucee, Adobe CF and BoxLang are unaffected. Copy the header-mapping block from the template.
+
+### Reload redirect keeps the subfolder (4.2.0)
+
+When an app runs under a subfolder (`set(subpath="/app1")`, or an IIS application at `/app1`), `?reload=true` on a running app restarts it and redirects from `public/Application.cfc`'s `$buildRedirectUrl()`. That function built the target from `cgi.path_info` alone, so `/app1/widgets?reload=true` came back to `/widgets`, outside the app ([#3948](https://github.com/wheels-dev/wheels/issues/3948)). The 4.2 template passes the path through the framework's `$reloadRedirectPath()`, which puts the subfolder back. The same function is used by the framework's own reload redirect.
+
+Replace the `return local.redirectPath;` at the end of `$buildRedirectUrl()` with the block below, and add `$normaliseRedirectPath()` after it. The fallback keeps the function working with a `vendor/wheels/` that doesn't have the helper yet.
+
+```cfm title="public/Application.cfc"
+		local.redirectPathResolved = false;
+		try {
+			if (StructKeyExists(application, "wo")) {
+				local.redirectPath = application.wo.$reloadRedirectPath(path = local.redirectPath);
+				local.redirectPathResolved = true;
+			}
+		} catch (any e) {
+			// No such helper (an older vendor/wheels): use the fallback below.
+		}
+		if (!local.redirectPathResolved) {
+			local.redirectPath = this.$normaliseRedirectPath(local.redirectPath);
+		}
+
+		return local.redirectPath;
+	}
+
+	public string function $normaliseRedirectPath(required string path) {
+		local.len = Len(arguments.path);
+		local.i = 1;
+		while (local.i <= local.len) {
+			local.code = Asc(Mid(arguments.path, local.i, 1));
+			if (local.code == 47 || local.code == 92 || local.code <= 32 || local.code == 127) {
+				local.i++;
+			} else {
+				break;
+			}
+		}
+		if (local.i == 1) {
+			return arguments.path;
+		}
+		if (local.i > local.len) {
+			return "/";
+		}
+		return "/" & Mid(arguments.path, local.i, local.len - local.i + 1);
+	}
+```
+
+**Fails safe at the site root:** nothing changes for an app served at `/`. **Does not fail safe under a subfolder:** the app restarts, but the browser is redirected to a path outside it.
+
+### Mappings anchored to `public/Application.cfc` (4.2.0)
+
+`public/Application.cfc` built its mappings with `expandPath("../app/")`, `expandPath("../vendor/")` and so on, and the SQLite and H2 datasources in `config/app.cfm` used `expandPath("../db/...")`. `expandPath()` resolves against the directory of the page that was requested, so a `.cfm` in a subfolder of `public/` (for example `public/reports/export.cfm`) got mappings pointing inside `public/`, and the request failed with `can't find component [wheels.events.EventMethods]` ([#4470](https://github.com/wheels-dev/wheels/issues/4470)). The 4.2 template builds every path from the folder above `public/Application.cfc` instead. To make the same change in an existing app:
+
+1. **Apps generated by Wheels 4.0.x only:** make `this.wheels.rootPath` this file's own directory. The 4.0 template used the requested page's directory, which has the same problem. Apps generated by 4.1 or later already have the second line:
+
+   ```cfm title="public/Application.cfc"
+   // before (4.0.x)
+   this.wheels.rootPath = GetDirectoryFromPath(GetBaseTemplatePath());
+   // after
+   this.wheels.rootPath = GetDirectoryFromPath(GetCurrentTemplatePath());
+   ```
+
+2. Add this line after the one that sets `this.wheels.rootPath`:
+
+   ```cfm title="public/Application.cfc"
+   this.wheels.projectRoot = REReplace(this.wheels.rootPath, "[^/\\]+[/\\]$", "");
+   ```
+
+3. Replace each `expandPath("../` in `public/Application.cfc` with `this.wheels.projectRoot & "`. For example, `expandPath("../vendor/")` becomes `this.wheels.projectRoot & "vendor/"`.
+
+4. Do the same for any `expandPath("../db/...")` in `config/app.cfm`, which `public/Application.cfc` includes after the mappings are set:
+
+   ```cfm title="config/app.cfm"
+   connectionString: "jdbc:sqlite:" & this.wheels.projectRoot & "db/development.sqlite"
+   ```
+
+**Fails safe** for an app that only serves pages through `public/index.cfm`. **Does not fail safe** for a `.cfm` in a subfolder of `public/` that runs your `Application.cfc`: every request to it fails.
+
+### Event templates without leading whitespace (4.2.0)
+
+The `app/events/*.cfm` templates (`onrequeststart.cfm`, `onrequestend.cfm`, `onsessionstart.cfm` and their siblings) are included straight into the response buffer, where a bare `cfscript` block and a trailing newline put blank lines before every response ([#3882](https://github.com/wheels-dev/wheels/issues/3882)). New apps wrap them in `cfsilent` with no trailing newline.
+
+**Fails safe** for HTML pages. It does not for byte-exact responses: a `renderText()` of an XML document is ill-formed when blank lines come before `<?xml …?>`.
+
+Wrap these seven files in `<cfsilent>…</cfsilent>` with no trailing newline, or delete the empty placeholders you don't use:
+- `onabort.cfm`
+- `onapplicationend.cfm`
+- `onapplicationstart.cfm`
+- `onrequestend.cfm`
+- `onrequeststart.cfm`
+- `onsessionend.cfm`
+- `onsessionstart.cfm`
+
+`cfsilent` suppresses only output, so event code (including `cfheader`) still runs. **Leave the output templates alone:** `onerror.cfm`, `onerror.json.cfm`, `onerror.xml.cfm`, `onmaintenance.cfm` and `onmissingtemplate.cfm` are the pages Wheels shows for errors, maintenance and missing files, and wrapping them in `cfsilent` would make those pages blank. Restart the server after the edit; a reload keeps serving the old templates.
+
+### Commit `vendor/` (4.2.0)
+
+`wheels new` apps now commit `vendor/`: the generated `.gitignore` no longer ignores it, so a clone, CI run or image build has the framework and every package added with `wheels packages add`.
+
+**Fails safe** on the machine that has `vendor/`. A fresh clone of an app that ignores it has no framework and nothing to restore it from. Remove the `/vendor/` line from `.gitignore` and commit `vendor/`. Check `git status` first: `vendor/` should hold `wheels/` and your packages, not a backup of the old framework.
+
+### Dead format rule in `public/urlrewrite.xml` (optional)
+
+The "Convert dot to format parameter" rule is gone from the shipped `urlrewrite.xml` ([#4132](https://github.com/wheels-dev/wheels/issues/4132)). Its regex had doubled backslashes, so it never matched a normal URL, and format suffixes such as `/posts.json` work because the router reads them from the path.
+
+**Fails safe:** the rule does nothing. Delete it from your `public/urlrewrite.xml` if you like.
+
+### AI coding docs (optional)
+
+The `CLAUDE.md` that ships with apps is now under 8 KB, with its reference topics in `.ai/<topic>.md` and an `AGENTS.md` that points agents at them ([#3960](https://github.com/wheels-dev/wheels/issues/3960)). Apps installed from the 4.x `wheels-base-template` download also got the framework maintainers' docs instead of the application-developer ones ([#3947](https://github.com/wheels-dev/wheels/issues/3947)).
+
+**Fails safe.** If you use AI coding tools, copy `CLAUDE.md`, `AGENTS.md` and `.ai/` from a fresh `wheels new` app, and delete a `.claude/` folder that came from the base template.
+
+## Behaviour changes to check
+
+These need no file edits, but code that relied on the old behaviour changes.
+
+### App tests use the test database and test application
+
+`/wheels/app/tests` and `wheels test` now default to the `<datasource>_test` datasource. If it doesn't exist, they refuse to run rather than using your primary datasource. Create it, or run against the primary datasource on purpose with `wheels test --no-test-db` (URL: `useTestDB=false`). Specs run in a separate test application (`<app name>_wheelsTest`), which needs `WHEELS_ENV` set to `development` or `testing`.
+
+For a SQLite app, `wheels new` already adds the test datasource to `config/app.cfm`, next to the main one:
+
+```cfm title="config/app.cfm"
+this.datasources["myapp_test"] = {
+	class: "org.sqlite.JDBC",
+	connectionString: "jdbc:sqlite:" & this.wheels.projectRoot & "db/test.sqlite"
+};
+```
+
+For another database, add a `myapp_test` entry with the same settings as `myapp`, pointing at a separate, empty database. The `tests/populate.cfm` that `wheels new` creates runs your migrations against it before each run.
+
+A CLI too old to send `useTestDB=false` can still run the suite against the primary datasource with `set(allowTestsAgainstPrimaryDatasource=true)` in `config/settings.cfm`. Specs then write to that database, and each run logs a warning to `wheels.log`. The setting only applies when the request has no `useTestDB` parameter: `wheels test`, which sends `useTestDB=true`, still requires `<datasource>_test`.
+
+The same rule applies to a `tests/runner.cfm` of your own: the run uses `<datasource>_test`, or it is refused unless you ask for the primary datasource as above. A runner copied from an older Wheels release (it sets `dataSourceName` from `coreTestDataSourceName` and includes its own `populate.cfm`) keeps working: for the duration of the run, both settings point at `<datasource>_test`. Replace it with the runner `wheels new` creates, a single include of `wheels/tests/app-runner.cfm`, so your app gets the built-in runner's behaviour, including running `tests/populate.cfm` against the test database. The legacy RocketUnit app runner (`set(testFramework="rocketunit")`) does not apply this rule; run app tests with WheelsTest, the default, to get it.
+
+HTTP requests your specs make reach that same test application, so they see the same datasource as the spec code, when they come from:
+- `$testClient()`;
+- a `wheels.wheelstest.TestClient` you create inside the spec run (including in a thread started during the run) whose `baseUrl` points at the test server: a loopback host (`localhost`, `127.x.x.x`, `[::1]`) or the host of a configured `testClientBaseUrl`;
+- a subclass of `TestClient` whose `init()` calls `super.init()`, under the same conditions.
+
+Some clients send their requests to the live application:
+- a client created outside a test run, such as in a scheduled task or a script;
+- a client pointed at another host.
+
+For a test server on another host name, set `testClientBaseUrl` or use `$testClient()`. If your suite runs in a Docker container that publishes the server on a different port (`-p 8080:60007`), set `testClientBaseUrl` to the address inside the container; see [Setting the test client's base URL](/v4-2-0/testing/controller-tests/#setting-the-test-clients-base-url). To address the live application from a spec on purpose, pass `testContext=false` to `$testClient()` or to `new wheels.wheelstest.TestClient()`.
+
+If a `TestClient` subclass or a test helper in your app sets the `X-Wheels-Test-Context` header or the `WHEELS_TEST_CONTEXT` cookie itself (a pattern from 4.1), delete those lines. `TestClient` and `$testClient()` now send the test context for you, and a value set by hand replaces theirs, so the requests reach the live application and its primary datasource (errors such as a missing table).
+
+The framework's own suite (`/wheels/core/tests`) is stricter when a run would use the app's primary datasource: it ignores `allowTestsAgainstPrimaryDatasource` ([#4254](https://github.com/wheels-dev/wheels/pull/4254)). Without `<datasource>_test` such a run is refused and the log notes that the setting was ignored; only an explicit `useTestDB=false` runs it against the primary datasource. Its `populate.cfm` drops and recreates tables, so it never reaches your real data through the setting. Runs that pick another datasource (`?db=`, or a `coreTestDataSourceName` that isn't the primary) are unchanged, except that a `coreTestDataSourceName` naming a datasource that doesn't exist now gets a 409 response explaining the fix.
+
+If `config/settings.cfm` sets `dataSourceName` but not `coreTestDataSourceName`, `coreTestDataSourceName` now defaults to that `dataSourceName`, so the framework's suite takes the `<datasource>_test` rule above. It used to default to a datasource named after the folder of the app's front controller (`public` in a `wheels new` app), which failed with `Datasource [public] doesn't exist`. If you ran the suite on a datasource with that name, set `coreTestDataSourceName` to it.
+
+A test run keeps the runner's 30-minute request timeout ([#4263](https://github.com/wheels-dev/wheels/pull/4263)). The `tests/populate.cfm` that 4.1's `wheels new` created starts with `<cfsetting requestTimeOut="300">`; the 4.2 runner restores its own limit after your `populate.cfm` runs, so you can leave the line or delete it. A run that is stopped before it finishes is now reported as an error, and says when the request timeout stopped it, instead of 0 passed, 0 failed, 0 errors.
+
+Browser specs that don't run no longer count as passed. Without Playwright (or in CI without `WHEELS_BROWSER_CI_ENABLE`), each `browserDescribe()` spec is reported as skipped, with the reason, and `wheels test` reports the skips (`2 passed, 1 skipped`) instead of a clean pass. When Playwright is installed but the browser can't start, each one is an error unless `WHEELS_BROWSER_SKIP_LAUNCH_FAILURES=true`. A CI job that ran browser specs without a browser now shows them; see [Browser tests](/v4-2-0/testing/browser-tests/).
+
+### `findAll(returnAs="structs")` returns an array
+
+`findAll()` has always documented `returnAs="structs"` (and `"struct"`) as an array of structs, but through 4.1 it returned a struct keyed by row number: `{1: {...}, 2: {...}}`. From 4.2 it returns the documented array ([#4035](https://github.com/wheels-dev/wheels/pull/4035)). `findInBatches(returnAs="structs")` hands its callback the same array.
+
+**What keeps working:** indexing rows by position (`rows[1].name`).
+
+**What changes:**
+
+- `ArrayLen(rows)` and the other array functions now work, and the result serializes to a JSON array (`[{...}]`, not `{"1": {...}}`), so a `renderWith(data=rows)` API response changes shape.
+- `StructCount()`, `StructKeyList()`, `StructKeyArray()` and `StructIsEmpty()` on the result now throw. Use `ArrayLen()` and `ArrayIsEmpty()`.
+- Every `for (... in rows)` loop changes meaning. On the 4.1 struct, `for (key in rows)` iterated the keys (`"1"`, `"2"`); now it hands you each row struct. Loop over the rows directly, `for (row in rows) { ... }`, and drop any `rows[key]` lookup inside the loop.
+- With no match, `findAll(returnAs="structs")` returns `[]` instead of `{}`.
+
+The single-record finders didn't work with the old shape and now do: `findOne(returnAs="struct")` and `findByKey(returnAs="struct")` return the record's struct rather than a `{1: {...}}` wrapper, and `findEach(returnAs="struct")` calls its callback once per record. With no match, they still return an empty struct `{}`. The query builder's `findOne(returnAs="struct")` after `offset()` now returns `{}` on no match too (including an offset past the last row), where it used to return `false`.
+
+To find affected code, search `app/` and `tests/` for `returnAs="structs"`, `returnAs="struct"` and `returnAs = "struct`. For code that must run on both 4.1 and 4.2, `returnAs="array"` already returned an array of structs in 4.1 and is unchanged.
+
+### `X-Forwarded-Proto` needs `trustProxyHeaders`
+
+In 4.1, `urlFor(onlyPath=false)` and asset URLs took `https://` from an `X-Forwarded-Proto: https` request header even without the opt-in. In 4.2 that header sets the URL scheme only when `set(trustProxyHeaders=true)` is on; a real TLS connection always counts as `https` ([#3836](https://github.com/wheels-dev/wheels/issues/3836)). **Apps behind a trusted TLS-terminating reverse proxy must set `set(trustProxyHeaders=true)` before upgrading,** or their absolute URLs come out as `http://`. The one-time warning added for this in 4.1 ([#3835](https://github.com/wheels-dev/wheels/pull/3835)) is gone.
+
+### Validation `condition` / `unless`: bare names are resolved
+
+A bare property or method name in a `condition` or `unless` expression now means `this.<name>` when the record has it ([#3928](https://github.com/wheels-dev/wheels/issues/3928)). That holds both alone (`condition="isActive"`) and on the left of a comparison (`condition="status != 'draft'"`). In 4.1, a lone name evaluated to `false`, so the rule was **skipped**. A left-hand name was compared as its own text, so the rule **always ran**. A validation your app relied on being skipped may now run, so search your models for `condition=` and `unless=` and run your model specs.
+
+4.1 already threw `Wheels.InvalidValidationCondition` for expressions it couldn't parse. 4.2 adds the shapes it used to mis-run silently: a bare name the record doesn't have, an expression that isn't one value or one complete `left operator right` comparison, a `this.` reference on the **right** of a comparison, and the word operators `is`, `and` and `or` on the `this.` path ([#3964](https://github.com/wheels-dev/wheels/issues/3964)). Replace `is` with `eq` (or `==`), `and` with `&&`, `or` with `||`, and put any `this.` reference on the left.
+
+### Association `joinType` values are checked
+
+`joinType` accepts `inner`, `outer`, `left` and `left outer` (the last three all emit `LEFT OUTER JOIN`). Any other value throws `Wheels.InvalidJoinType` when the association is registered, at application start ([#3936](https://github.com/wheels-dev/wheels/issues/3936)). Before, `joinType="left"` emitted a `LEFT JOIN` that the nested-include grouping didn't recognise, so a nested include under it was silently dropped.
+
+### Production error pages return 404, 403 or 406 for Wheels errors
+
+With `showErrorInformation` off (the default outside development), the error page now returns the HTTP status that fits the Wheels error instead of `500` for every error ([#4238](https://github.com/wheels-dev/wheels/pull/4238)): `404` for an unknown route, record, view, file or action (`Wheels.RouteNotFound`, `RecordNotFound`, `ViewNotFound`, `FileNotFound`, `ActionNotAllowed`, `ActionParameterMissing`), `403` for `Wheels.NotAuthorized` or an invalid CSRF token, and `406` for `Wheels.FormatNotAcceptable`. Other `Wheels.*NotFound` errors, such as a missing table, datasource or model, still return `500`, so monitoring still sees server faults. Development already returned these statuses. Monitoring, alerts or log searches that count production `500`s will see fewer of them; if one keys on `500` for these cases, update it to the new statuses.
+
+### Controller method integration is cached per class
+
+Outside development, Wheels now works out once per controller class which framework helpers to mix into a controller and which `super<name>` aliases to create, and applies that to every new instance ([#4149](https://github.com/wheels-dev/wheels/issues/4149)). The new `cacheControllerIntegration` setting is `true` in every environment except development. One rare pattern changes: a controller that defines a method only in some cases while it's being constructed, and calls `super<name>()` for it, no longer gets that `super<name>` alias. Set `set(cacheControllerIntegration=false)` for such an app. See [Controller method integration cache](/v4-2-0/digging-deeper/caching/#controller-method-integration-cache).
+
+### `renderNotFound` is a framework helper
+
+`renderNotFound(message, type, extendedInfo)` is a new public controller helper that produces a 404 from app code ([#3900](https://github.com/wheels-dev/wheels/issues/3900)). Because it is public, it is now a reserved action name: an existing controller **action** literally named `renderNotFound` gets `Wheels.ActionNotAllowed` instead of dispatching. Rename such an action. A controller that already defines its own `renderNotFound` helper overrides the framework one, and that keeps working.
+
+### `isSafeRedirectUrl` is a framework helper
+
+`isSafeRedirectUrl(redirectUrl)` is a new public controller helper that reports whether a URL stays on this site, by the same rule `redirectTo(url=…)` applies ([#4217](https://github.com/wheels-dev/wheels/issues/4217)). Like `renderNotFound` above, it is now a reserved action name: an existing controller **action** named `isSafeRedirectUrl` gets `Wheels.ActionNotAllowed` instead of dispatching. Rename such an action. A controller that already defines its own `isSafeRedirectUrl` helper overrides the framework one, and that keeps working.
+
+### A failed `verifies()` without a handler returns 400
+
+A `verifies()` that fails and declares no `handler` and no redirect arguments now ends the request with **HTTP 400** ([#4296](https://github.com/wheels-dev/wheels/pull/4296)). In 4.1 it returned a silent `200` with an empty body, although the declared precondition wasn't met. A JSON request gets `{"error":"Verification failed"}`; other formats get an empty body. A `verifies()` with a `handler` or redirect arguments is unchanged.
+
+If a client relied on the old `200`, handle the `400` there, or give the `verifies()` call a `handler=` (or redirect arguments) so your code owns the failure response.
+
+### MySQL boolean columns are `BIT(1)`
+
+On MySQL, `t.boolean()` and `addColumn(columnType="boolean")` now create `BIT(1)` instead of `TINYINT(1)` ([#3897](https://github.com/wheels-dev/wheels/issues/3897)). Existing columns are unchanged. If your DSN sets `tinyInt1isBit=false`, existing `TINYINT(1)` booleans read as plain integers and fail validation as "is not a number": drop that DSN option, or convert the column with `changeColumn(columnType="boolean")`. `BIT(1)` values read back as `1` on Lucee and Adobe CF and as `true` on BoxLang; both are truthy and compare equal in CFML.
+
+### MySQL `t.bigInteger()` columns are signed
+
+On MySQL, `t.bigInteger()` now creates a signed `BIGINT` instead of `BIGINT UNSIGNED` ([#4121](https://github.com/wheels-dev/wheels/issues/4121)). The new columns accept negative values and validate as integers. Existing `BIGINT UNSIGNED` columns are unchanged, and `changeColumn()` keeps a column's current signedness unless you pass `unsigned`.
+
+MySQL requires both sides of a foreign key to have the same signedness. A new `t.bigInteger()` or `t.integer()` column that references an id created by an earlier version (`BIGINT UNSIGNED`) therefore fails with "Referencing column … and referenced column … are incompatible". Declare it unsigned:
+
+```cfm
+t.bigInteger(columnNames = "accountId", unsigned = true);
+```
+
+`unsigned` is ignored on databases without unsigned types.
+
+### Oracle integer columns carry a precision
+
+On Oracle, new `t.integer()`, `t.references()` and `id` columns are `NUMBER(10)`, new `t.bigInteger()` columns are `NUMBER(19)`, and new `t.boolean()` columns before Oracle 23ai are `NUMBER(1)` ([#4097](https://github.com/wheels-dev/wheels/issues/4097)). Earlier releases created a bare `NUMBER`, which binds as a decimal and validates as a float. The new columns validate as integers, so a fractional value such as `1.5` now fails automatic validation instead of being stored. Existing columns are unchanged and keep their current typing, and `changeColumn()` without a `precision` argument keeps a column's current precision, so it never re-types one. To convert one, see [Integer columns on Oracle](/v4-2-0/basics/migrations/).
+
+On Oracle 23ai and later, new `t.boolean()` columns are a native `BOOLEAN` ([#4057](https://github.com/wheels-dev/wheels/pull/4057)), which the model maps to `cf_sql_bit`; earlier Oracle releases get `NUMBER(1)` as above. Existing numeric boolean columns are unchanged.
+
+### Wide numbers are stored and matched exactly
+
+Two kinds of number used to reach the database as a different value, and are now bound exactly:
+
+- On Oracle, a whole number outside the signed 64-bit range (above 9,223,372,036,854,775,807 or below -9,223,372,036,854,775,808) written to or compared against a `NUMBER` column. It was clamped, wrapped or rounded depending on the engine ([#4162](https://github.com/wheels-dev/wheels/issues/4162)).
+- On Lucee and BoxLang with PostgreSQL, SQL Server, MySQL or CockroachDB, a `DECIMAL` or `NUMERIC` value with more than 15 significant digits. It went through a double ([#4172](https://github.com/wheels-dev/wheels/issues/4172)). Values with up to 15 significant digits, which covers typical money amounts, bind as before.
+
+Nothing needs to change in your code. If your app stores such values, rows written before 4.2 may hold the altered number, and a `where` on the exact value now matches only rows that were stored exactly. Check those columns.
+
+### SQLite date columns are validated as dates
+
+On SQLite, new `t.date()`, `t.datetime()`, `t.time()` and `t.timestamp()` columns are declared `DATE`, `DATETIME` and `TIME` instead of `TEXT` ([#4093](https://github.com/wheels-dev/wheels/issues/4093)). The model validates them as dates, so automatic validations now reject a value such as `"not a date"` that earlier releases stored. Values are still stored as ISO-8601 text, exactly as before. Existing `TEXT` date columns are unchanged: they keep the old check, which treats a `TEXT` column as a date only when its name is a word such as `created`, `updated` or `date`, so a column like `publishedAt` gets no date check. To give an existing column the new behaviour, convert it in a migration with `changeColumn(columnType="datetime")` (or `"date"`). ISO-8601 text is kept as it is. Converting to any date type also rewrites older values in that column: the CFML date literals `{ts 'X'}`, `{d 'D'}` and `{t 'T'}` become `X`, `D 00:00:00` and `1899-12-30 T`, and bare text that is exactly `YYYY-MM-DD` or `HH:MM:SS` becomes `YYYY-MM-DD 00:00:00` or `1899-12-30 HH:MM:SS`. Any other value is copied unchanged.
+
+**Columns declared `DATE` or `TIME` by raw SQL or another tool.** Before 4.2, Wheels bound a SQLite column *declared* `DATE` as `cf_sql_date` and one declared `TIME` as `cf_sql_time`, and the driver stored those values as epoch-millisecond integers. Wheels now writes ISO-8601 text to them, so a column with old rows would mix integers and text, which breaks comparisons and sorting. Migrator-created columns aren't affected: they were `TEXT` before 4.2. To check a table, run `SELECT typeof(col), count(*) FROM tbl GROUP BY 1;`. If any rows are `integer`, convert them before writing with 4.2:
+
+```sql
+UPDATE tbl SET dateCol = strftime('%Y-%m-%d', dateCol / 1000, 'unixepoch', 'localtime') WHERE typeof(dateCol) = 'integer';
+UPDATE tbl SET timeCol = strftime('%H:%M:%S', timeCol / 1000, 'unixepoch', 'localtime') WHERE typeof(timeCol) = 'integer';
+```
+
+Keep `'localtime'`: the old values are midnight (or the time of day) in the server's timezone, and without it a server east of UTC converts each date to the previous day. Run the conversion with the same timezone as the app server.
+
+**Convert before you upgrade.** If you don't, what happens depends on the engine. On BoxLang, a record holding an unconverted value fails validation on that column ("is invalid") even when the save doesn't touch it, so the record can't be saved. On Lucee and Adobe ColdFusion the record saves and keeps its integers, because Wheels updates only the columns that changed, but the first new value the app writes to such a column is stored as text, and the column mixes formats until you convert. The recipe changes only `integer` rows, so it's safe to run more than once. Run it again after every app process is on 4.2: processes still on 4.1 keep writing integers.
+
+**Date literals written by `updateAll()`.** Before 4.2, `updateAll()` on SQLite wrote CFML date literals such as `{ts '2026-10-03 04:31:00'}` into date columns instead of ISO-8601 text ([#4147](https://github.com/wheels-dev/wheels/issues/4147)); `save()` wasn't affected. In a `TEXT` column these values read back as plain strings, but once the column is declared `DATETIME` they fail to read. `changeColumn()` to a date type repairs them for you (see above). If you convert a column with your own SQL, or keep it `TEXT`, check for these rows and repair them first:
+
+```sql
+-- Check: rows holding a CFML ODBC date literal ({ts '...'}, {d '...'}, {t '...'}).
+-- char(123) and char(125) are { and }: written as literal braces, a JDBC driver (and so
+-- Wheels' execute()) reads them as an escape sequence and rewrites the SQL.
+SELECT COUNT(*) AS n FROM <table> WHERE <column> LIKE char(123) || 'ts ''%''' || char(125) OR <column> LIKE char(123) || 'd ''%''' || char(125) OR <column> LIKE char(123) || 't ''%''' || char(125);
+
+-- Repair: {ts 'X'} -> X, {d 'D'} -> 'D 00:00:00', {t 'T'} -> '1899-12-30 T' (what save() writes).
+UPDATE <table> SET <column> = CASE WHEN <column> LIKE char(123) || 'ts ''%''' || char(125) THEN substr(<column>, instr(<column>, '''') + 1, length(<column>) - instr(<column>, '''') - 2) WHEN <column> LIKE char(123) || 'd ''%''' || char(125) THEN substr(<column>, instr(<column>, '''') + 1, length(<column>) - instr(<column>, '''') - 2) || ' 00:00:00' WHEN <column> LIKE char(123) || 't ''%''' || char(125) THEN '1899-12-30 ' || substr(<column>, instr(<column>, '''') + 1, length(<column>) - instr(<column>, '''') - 2) ELSE <column> END WHERE <column> LIKE char(123) || 'ts ''%''' || char(125) OR <column> LIKE char(123) || 'd ''%''' || char(125) OR <column> LIKE char(123) || 't ''%''' || char(125);
+```
+
+The repair writes what `save()` writes: `{ts 'X'}` becomes `X`, `{d 'D'}` becomes `D 00:00:00` and `{t 'T'}` becomes `1899-12-30 T`. It changes only rows holding a literal, so it's safe to run more than once.
+
+### An empty string in `where` matches empty strings
+
+An empty-string value in a `where` condition now binds as a real `''` ([#4055](https://github.com/wheels-dev/wheels/issues/4055)). Through 4.1 it bound as SQL NULL after your operator, so `col = ''`, `col <> ''` and `col != ''` all compared against NULL and matched no rows.
+
+**What changes:**
+
+- `count(where="brand = ''")` and `findAll(where="brand = ''")` return the rows that store an empty string.
+- `col <> ''` and `col != ''` return every row whose value is neither empty nor NULL.
+- The same applies to an interpolated value that happens to be empty: `where="col = '#x#'"` with `x = ""`.
+- It applies everywhere a `where` string is used: the finders and `count()`, dynamic finders such as `findOneByBrand("")`, the query builder's `where("brand", "")`, and `updateAll()` / `deleteAll()`. **`updateAll()` and `deleteAll()` with such a condition now change or delete those rows, where in 4.1 they touched nothing.**
+- A lookup such as `findOne(where="token = ''")` now matches rows that store an empty string. The same goes for a lookup keyed on a request value that turns out empty, such as `findOne(where="token = '#params.token#'")` or `findOneByToken(params.token)`: in 4.1 it found nothing. Reject empty input before looking it up, or store cleared values as NULL rather than `''`.
+
+**What doesn't change:**
+
+- The unquoted `NULL` keyword: `col IS NULL` and `col IS NOT NULL` work as before. To match NULL, use them or `whereNull()` / `whereNotNull()`.
+- An empty value whose column binds as a number, date, time or boolean still matches nothing, since such a column can't hold `''`. What counts is the type Wheels binds the column with: SQLite stores date and time values as text and binds every date and time column as a string, so on SQLite an empty value compared with a date, datetime or time column follows the new behaviour (`createdAt <> ''` matches every non-empty, non-NULL datetime).
+- On Oracle, which stores `''` as NULL, an empty-string comparison still matches no rows.
+
+To find affected code, search `app/` for `= ''`, `<> ''`, `!= ''`, for `where` strings that interpolate a value that may be empty (especially `params.*` values and `updateAll()` / `deleteAll()` calls), and for dynamic finders (`findOneBy…`, `findAllBy…`) called with request values.
+
+### Date values in `where()` and dynamic finders match on SQLite
+
+On SQLite, a date passed to the query builder (`where()`, `whereBetween()`, `whereIn()`) or to a dynamic finder (`findOneByPublishedAt(date)`) now compares as a date ([#4281](https://github.com/wheels-dev/wheels/pull/4281)). It used to reach the SQL as its CFML literal (`{ts '...'}`), which never matched a stored date, so the query returned no rows. Code that relied on such a query finding nothing now gets the matching rows. Other databases already matched; they now receive the plain date text.
+
+### `enqueue()` throws `Wheels.Job.EnqueueFailed`
+
+`enqueue()`, `enqueueIn()` and `enqueueAt()` throw `Wheels.Job.EnqueueFailed` when the job can't be written to the job store ([#4266](https://github.com/wheels-dev/wheels/pull/4266)). In 4.1 they returned a struct with `persisted: false`, which was easy to miss, so failed enqueues went unnoticed. Don't read `persisted: false` as a failure any more: a job deferred to a commit (next section) also returns it. Replace `persisted` checks with a check of `status` (`"pending"` once written, `"deferred"` until the commit) where you need one, and where an enqueue is best-effort, wrap it in `try` / `catch (Wheels.Job.EnqueueFailed e)`.
+
+### `abort` inside a Wheels transaction rolls it back on BoxLang too
+
+A request that ends with `abort` inside a Wheels transaction (`invokeWithTransaction()`, a nested call that joins it, or a savepoint unit) now rolls that transaction back on BoxLang, as it already did on Lucee and Adobe ColdFusion. On BoxLang, 4.1 kept the writes made before the `abort`. If a BoxLang app relies on those writes, let the transaction finish (return from the method) before it aborts. Raw `transaction {}` blocks aren't managed by Wheels and are unchanged.
+
+### `afterRollback` runs after the transaction block when the method throws
+
+When a Wheels-managed transaction rolls back because its method threw, `afterRollback` callbacks now run after the transaction block has ended. That's where they already ran for a rollback without an exception (`transaction="rollback"`, or a method that returns `false`). In 4.1 they ran inside the block, after the rollback. An `afterRollback` callback that writes to the database therefore keeps its write on this path too; in 4.1 that write was discarded with the transaction. A callback that throws doesn't replace the method's exception. If an `afterRollback` callback relied on its writes being discarded, move that write into the transaction itself.
+
+### A job enqueued in a transaction on another datasource waits for the commit
+
+Inside a Wheels-managed transaction (a model save or `invokeWithTransaction()`) on another datasource than the job store's, the job is now written when the transaction commits, and dropped if it rolls back ([#4282](https://github.com/wheels-dev/wheels/pull/4282)). That's a tenant datasource under `TenantResolver`, or a model with its own `dataSource()`. In 4.1, depending on the engine, such a job could survive a rollback, land in the tenant's database where no worker reads it, or not be written at all. `enqueue()` then returns `{status: "deferred", deferred: true, persisted: false}`. That `persisted: false` is not a failure; check `status` instead. A write that fails after the commit throws `Wheels.Job.EnqueueFailed`, and the saved record stays committed. A raw `transaction {}` block isn't tracked, so enqueue after it ends. See [Background jobs: with a tenant datasource](/v4-2-0/digging-deeper/background-jobs/#with-a-tenant-datasource).
+
+### The job table gains a `claimTimeout` column
+
+A worker now records the `timeout` it claimed a job with, and a stale job is reaped on the claiming worker's timeout rather than the polling worker's, so workers with different timeouts can share a queue ([#3989](https://github.com/wheels-dev/wheels/issues/3989)). The `wheels_jobs.claimTimeout` column is added for you on first use, including to tables created by 4.1. If the database user can't run `ALTER TABLE`, the worker falls back to the polling worker's timeout and retries the change after a back-off; grant the privilege once (or add the column yourself) to get the new behaviour.
+
+### A reaped job's late finish can no longer overwrite its retry
+
+Every job claim now writes a fresh `claimToken` (and the claiming host, `claimedBy`) to `wheels_jobs`, and a worker can only complete, retry or fail a job while the row still carries its token. In 4.1, a worker whose job was reaped as stale and claimed again could still finish afterwards and mark the new attempt `completed` (or requeue it) while that attempt was running. Its result is now discarded and logged as `Wheels.Job.Fenced`. Both columns are added on first use, like `claimTimeout`. Upgrade every worker: a 4.1 worker still claims and completes without a token, so fencing only holds once no 4.1 worker shares the table. Jobs already `processing` during the upgrade have no token and are reaped as before.
+
+### Jobs can be enqueued at most once with `uniqueKey`
+
+`enqueue()`, `enqueueIn()` and `enqueueAt()` accept `uniqueKey`, and only one job is written per key ([#4478](https://github.com/wheels-dev/wheels/issues/4478)). A duplicate returns `{enqueued: false, duplicate: true}` with the existing job's `id`. Every `enqueue()` result now includes `enqueued` and `duplicate`. Jobs enqueued without a key behave as before.
+
+The `wheels_jobs` table gains a nullable `uniqueKey` column with a unique index, filtered to non-NULL keys on SQL Server. On an existing table, the first worker poll or `enqueue(uniqueKey=...)` after the upgrade adds the column, sets it to each row's `id`, and builds the index under the migration lock. It doesn't wait if another instance holds the lock. Servers still on 4.1 keep enqueuing during a rolling upgrade: their rows get a NULL key, which never collides. On a large table, or where the database user can't `ALTER`, apply the change yourself first; the statements are in [The jobs table](/v4-2-0/digging-deeper/background-jobs/#the-jobs-table). On a SQL Server database below **compatibility level 100**, the filtered index can't be built; the upgrade's warning and the `Wheels.Job.UniqueKeyUnavailable` error now name the failed step and the fix for your level — raise the level, or (once every server runs 4.2) use a plain unique index ([#4489](https://github.com/wheels-dev/wheels/issues/4489)).
+
+### Jobs can call `heartbeat()`, and `this.idempotent` gates retry after a reap
+
+A job can now call `heartbeat()` from inside `perform()` to record that this attempt is still alive ([#4477](https://github.com/wheels-dev/wheels/issues/4477)). It stamps a new `wheels_jobs.heartbeatAt` column (added on first use, like `claimTimeout`; without it, `updatedAt` is stamped instead) for the current claim only, and throws `Wheels.Job.Fenced` if the claim was already reaped and reissued. It does **not** extend the attempt's `timeout` — the `timeout` is a hard cap per attempt, and `perform()` is stopped when it elapses however many times the job has heartbeated. Jobs also gain `this.idempotent`, **`true` by default**, which keeps today's at-least-once retry after a reap. A class that sets `this.idempotent = false` is **not** re-run after a reap: the reaped attempt ends in a new status, `interrupted`, counted in `queueStats()` and `getStats()` and prunable with `purge(status="interrupted")`. Nothing changes unless you add `heartbeat()` or set `this.idempotent = false`. See [Running Jobs on Multiple Servers](/v4-2-0/digging-deeper/running-jobs-on-multiple-servers/#record-liveness-with-heartbeat).
+
+### A per-host concurrency cap, a host registry, and drain/resume for deploys
+
+Three additions let several servers share one queue under control ([#4480](https://github.com/wheels-dev/wheels/issues/4480)), all opt-in and defaulting to today's behaviour:
+
+- `set(jobsMaxConcurrentPerHost = n)` caps how many jobs one server runs at once (default `0`: no cap). The cap is per host — the name a worker records in `claimedBy`, which `set(jobsHostName = "...")` overrides when several app servers share a machine.
+- A `wheels_job_hosts` registry table (one row per host; auto-created on first use, never inside a transaction) tracks each server's running count, cap, drain state, and code version. Set a release tag or git SHA with `set(jobsCodeVersion = "...")` to see which build each server runs during a rollout.
+- `new wheels.JobRunner()` exposes `tick()` (register, reap, run a bounded batch), `drain(expiresInSeconds)` / `resume()`, and `status()`. A draining host starts nothing new while its running jobs finish.
+
+### `wheels jobs drain` and `wheels jobs resume` for rolling deploys
+
+`wheels jobs drain` marks this server draining so it starts no new jobs while its running jobs finish; `wheels jobs resume` lifts it ([#4480](https://github.com/wheels-dev/wheels/issues/4480)). `wheels jobs drain --wait` polls until the server has no running jobs and exits non-zero if any remain when the wait runs out, so a deploy script can stop the server safely. `--expires=<seconds>` (default 3600, `0` = until resumed) sets when the drain lifts itself if nothing resumes it. `wheels jobs status` now also reports this server's running count, cap, and drain state. See [Drain a server before a deploy](/v4-2-0/digging-deeper/running-jobs-on-multiple-servers/#drain-a-server-before-a-deploy).
+
+### Recurring job schedules
+
+Jobs can now run on a recurring, cron-style schedule, declared in a new `config/schedules.cfm` ([#4481](https://github.com/wheels-dev/wheels/issues/4481)): `schedule("digest").job("DigestJob").cron("0 7 * * MON").timezone("America/New_York")`, or `.every(15, "minutes")`. Schedules sync into a new `wheels_job_schedules` table at application start (auto-created, never inside a transaction). A running worker checks them for you — `wheels jobs work`, `processQueue()`, and `JobRunner.tick()` each enqueue due slots as they poll, at most once every `jobsScheduleCheckSeconds` (default 15, 0 = off) per application ([#4509](https://github.com/wheels-dev/wheels/issues/4509)) — so once anything drains the queue, a schedule just runs; call `new wheels.JobScheduler().enqueueDue()` yourself only when nothing polls the queue. Each slot is enqueued with a `uniqueKey`, so every server checking produces one job per slot. Nothing changes for an existing app: there's no schedule until you add `config/schedules.cfm` or call the scheduler. `wheels new` does not create the file. See [Recurring schedules](/v4-2-0/digging-deeper/running-jobs-on-multiple-servers/#recurring-schedules).
+
+### Exclusive jobs and concurrency keys
+
+A job can now hold a cross-server lease while it runs ([#4496](https://github.com/wheels-dev/wheels/issues/4496)): `this.exclusive = true` lets at most one run of the class happen at a time on any server, and `this.concurrencyKey` or a `concurrencyKeyFor(struct data)` method (the method wins) scopes that to a key. A run that finds its lease held is put back to `pending` (its attempt isn't spent) and retries when the lease frees; `heartbeat()` renews an exclusive run's lease. The lease lives in a new `wheels_job_locks` table, auto-created on first use outside any transaction. `processQueue()`'s result now includes `leasesLost`, and its `skipped` count now counts lease-deferred runs. Nothing changes unless a job opts in — an existing job holds no lease. See [Exclusive jobs and concurrency keys](/v4-2-0/digging-deeper/running-jobs-on-multiple-servers/#exclusive-jobs-and-concurrency-keys).
+
+### Job lifecycle hooks, an app-wide failure hook, and a stored result
+
+Jobs gain optional lifecycle hooks ([#4498](https://github.com/wheels-dev/wheels/issues/4498)): `beforePerform(data)` and `afterPerform(data, result)` run as part of the work (a throw fails the attempt), while `onSuccess(result)` and `onFailure(error, attempt, isFinal)` run best-effort after the outcome is recorded — `isFinal` is true when the job won't be retried, including a reaped last attempt or an `interrupted` non-idempotent job. `set(jobsOnFailure = "component.path.method")` adds an application-wide failure hook, whose method takes a single named `event` argument — `{jobId, jobClass, queue, attempt, maxRetries, isFinal, error}`, with no job data. `perform()`'s return value is stored in a new `wheels_jobs.result` column (`VARCHAR(4000)`, `NVARCHAR(4000)` on SQL Server), added by the guarded auto-`ALTER`; without the column, jobs run as before and nothing is stored. Nothing fires unless a job defines a hook or you set `jobsOnFailure`. See [Lifecycle hooks and failure handling](/v4-2-0/digging-deeper/running-jobs-on-multiple-servers/#lifecycle-hooks-and-failure-handling).
+
+### Heartbeating jobs are reclaimed on a heartbeat grace
+
+A job that calls `heartbeat()` is now reclaimed once its beats stop for a **heartbeat grace**, even inside its `timeout`, instead of waiting for twice the timeout ([#4502](https://github.com/wheels-dev/wheels/issues/4502)). The grace is `set(jobsHeartbeatGraceSeconds = n)` (default `300`, floor `30`, `0` turns it off), or `this.heartbeatGrace` per class. A job that never heartbeats keeps the old claim window (`timeout` plus the reap grace), and `timeout` is still the hard cap on a single attempt. An exclusive job's heartbeat renews its lease by the same grace. Nothing changes unless a job heartbeats. See [Record liveness with `heartbeat()`](/v4-2-0/digging-deeper/running-jobs-on-multiple-servers/#record-liveness-with-heartbeat).
+
+### `wheels jobs work` runs each job for its own timeout
+
+The `wheels jobs work` worker used to cap every job at 300 seconds, whatever its `this.timeout` ([#4517](https://github.com/wheels-dev/wheels/issues/4517)). It now claims and runs each job with its own class timeout, as `processQueue()` does, so a job with `this.timeout = 900` gets its full fifteen minutes. `wheels jobs work --job-timeout=<seconds>` caps that (not `--timeout`, which on some CLI runtimes is the runtime's own root option and would stop the whole worker). A job class with a long `timeout` that relied on being cut off at 300 now runs longer; set `--job-timeout` or lower its `this.timeout`.
+
+### Installing the job schema as a migration
+
+`wheels jobs install` writes a migration (`app/migrator/migrations/<ts>_CreateWheelsJobTables.cfc`) that creates the job tables — `wheels_jobs`, `wheels_job_hosts`, `wheels_job_locks`, `wheels_job_schedules` — or tops up the ones Wheels auto-created, idempotently, generated from the running app's own schema ([#4499](https://github.com/wheels-dev/wheels/issues/4499)). `set(jobsAutoCreateTables = false)` then stops every runtime `CREATE`/`ALTER` of those tables, so no server changes the schema under load; with it set and a table missing, `enqueue()` and a worker poll throw `Wheels.Job.SchemaMissing` with the install guidance. The default is `true` (today's auto-create behaviour), so nothing changes until you opt out. On a multi-server production database, run `wheels jobs install`, apply the migration, and set `jobsAutoCreateTables = false`. See [The shared schema](/v4-2-0/digging-deeper/running-jobs-on-multiple-servers/#the-shared-schema).
+
+### A token-gated `/wheels/jobs/tick` route
+
+A scheduler that can only make an HTTP request can now run jobs inside the app server: each `POST /wheels/jobs/tick` runs one `JobRunner.tick()` and returns a JSON summary ([#4482](https://github.com/wheels-dev/wheels/issues/4482)). The route is **off (404) until `set(jobsRunnerToken = "...")`** is set; it then needs that token in the `X-Wheels-Jobs-Token` header (or `?token=` with `set(jobsRunnerTokenInQuery = true)`), compared in constant time, and refuses any request carrying a forwarding header — so call it on the server itself, not through a proxy. `wheels jobs tick` does one tick from the CLI. Nothing is exposed unless you set the token. See [Drive it over HTTP: the tick route](/v4-2-0/digging-deeper/running-jobs-on-multiple-servers/#drive-it-over-http-the-tick-route).
+
+### Job timestamps are stored in UTC on the database's clock
+
+Job times are now kept on the database's UTC clock rather than each server's local clock, so servers with skewed clocks or different time zones no longer disagree about whether a job is stale or due ([#4486](https://github.com/wheels-dev/wheels/issues/4486)). `wheels.JobClock` reads the database's UTC time about once a minute and corrects every job timestamp by the skew. The **CFML API is unchanged** — it stays in local time: `enqueueAt()` converts to UTC for storage, and `JobRunner.status()` and the queue stats convert back. Two things to check: on **H2**, run the JVM in UTC (`-Duser.timezone=UTC`), since H2 does timestamp arithmetic in the JVM zone (SQLite and the client/server databases are unaffected); and a database **upgraded from before 4.2 holds local-time rows**. On a non-UTC server, either upgrade once the queue is empty (no `pending`/`processing` jobs) and leave the offset at `0`, or set `this.convertLocalOffsetMinutes` in the `wheels jobs install` migration to the old servers' offset from UTC (`-300` for UTC-5, `60` for UTC+1) to convert existing rows once, in a single transaction with a marker so it's safe to re-run. Do neither and the old rows are misread: a delayed job runs early or late by the offset, and on a server behind UTC an in-flight job looks stale and is reclaimed. SQLite rows and servers already on UTC need neither. See [Clocks and skew](/v4-2-0/digging-deeper/running-jobs-on-multiple-servers/#clocks-and-skew).
+
+### CSRF accepts the `X-CSRF-Token` header on any request
+
+A valid `X-CSRF-Token` header now passes CSRF protection on any non-GET request ([#3959](https://github.com/wheels-dev/wheels/issues/3959)). In 4.1 the header was read only when the request also sent `X-Requested-With: XMLHttpRequest`, which Turbo and `fetch()` don't send. Nothing breaks: clients that send both keep working, and a request passes when either the form field or the header holds a valid token. `startFormTag()` and `buttonTo()` gain `authenticityToken=false` to leave the hidden field out of markup that is cached and shared.
+
+### Migrations run under a cross-process lock
+
+Instances that share a database now take turns running migrations ([#4134](https://github.com/wheels-dev/wheels/issues/4134)). The first `migrateTo()` creates a `wheels_migrator_locks` table, unless `createMigratorTable` is off, in which case there's no lock until you create the table. An instance that finds another one migrating waits up to `migrationLockTimeout` seconds (default 300), then fails with `Wheels.MigrationLockTimeout`. A long-running single migration step needs `migrationLockLease` (default 3600 seconds) set above its duration. If an instance died holding the lock, wait for its lease to run out, or clear it with `wheels migrate unlock --force` ([#4209](https://github.com/wheels-dev/wheels/issues/4209)). Plain `wheels migrate unlock` shows who holds it. Without the CLI, delete its row from `wheels_migrator_locks`, or call `releaseMigrationLock(force=true)` on `application.wheels.migrator`.
+
+### An empty `default` on a non-string column means no default
+
+In a migration, `default=""` on a column that isn't string-like (`bigInteger`, `binary`, `uniqueidentifier`, `integer`, `decimal`, `float`, `date` and so on) now means "no default" ([#4248](https://github.com/wheels-dev/wheels/pull/4248)). It renders as `DEFAULT NULL` when the column allows null and as no `DEFAULT` clause on a `NOT NULL` column. In 4.1, `bigInteger` and `uniqueidentifier` emitted a bare `DEFAULT`, `binary` emitted `DEFAULT ''`, and a `NOT NULL` column got `DEFAULT NULL NOT NULL`, which MySQL rejects; those migrations failed. They now run. Migrations that already worked produce the same schema.
+
+### Migration column option `null`
+
+Before Wheels 3.0, a migration column's nullability option was called `null`. 3.0 renamed it `allowNull` and dropped the old name, so Wheels 3.0 through 4.1 ignored `null`. No `NULL` / `NOT NULL` clause was emitted, and the column got the database's default, nullable on most databases. 4.2 reads `null` again as a deprecated alias of `allowNull`: `allowNull` wins when both are passed, and a warning is logged once per migration run.
+
+This matters for `null=false`. A database built or rebuilt by 3.0 through 4.1 from such a migration has the column nullable, and it may hold `NULL` rows. A database rebuilt on 4.2 from the same migration gets a `NOT NULL` column, stricter than the one you run in production. `wheels upgrade check` lists the migrations that use `null=false` and `null=true`. For each `null=false` column:
+
+1. Check the running database for `NULL` rows in that column.
+2. Fix or backfill them, then tighten the column with a new migration (`changeColumn(..., allowNull=false)`), or change the old migration to `allowNull=true` if the column should allow `NULL`.
+3. Rename `null` to `allowNull` in the migrations.
+
+### Unsupported migration column types fail at migrate time
+
+A migration that uses a column type the database adapter doesn't map, such as `t.column(columnName="payload", columnType="jsonb")`, now fails with `Wheels.Migrator.UnsupportedColumnType`, naming the type and the adapter ([#4095](https://github.com/wheels-dev/wheels/issues/4095)). Earlier releases emitted the column with no type. On most databases that was already a DDL error. On SQLite it created a typeless column whose model failed to load. If an existing SQLite migration relies on that, change the column to a supported type (for example `text` for JSON) before running it on a fresh database. The error's details list the supported types. Every type the `t.*()` column helpers emit is supported on every adapter.
+
+### SQL Server `DATETIME` conditions match fractional values
+
+On SQL Server, an `=`, `<>`, `IN` or `NOT IN` condition on a `DATETIME` or `SMALLDATETIME` column now compares in the column's own type ([#4326](https://github.com/wheels-dev/wheels/issues/4326)). A value with a fraction of a second, such as `createdAt = '2026-01-02 10:00:00.123'` on a `timestamps()` column, used to match no row, because the value was sent as `DATETIME2(7)` while the column stores 1/300-second (or one-minute) steps. An `=` or `IN` condition with such a value can now match the row that holds it, and a `<>` or `NOT IN` condition now leaves that row out, as SQL Server does with a literal: `createdAt <> '2026-01-02 10:00:00.001'` used to return a row stored as `10:00:00.000` and now doesn't, because `.001` rounds to `.000` in a `DATETIME` (and `23:59:59.999` rounds to the next midnight). Whole-second values, ranges (`<`, `>=`, `BETWEEN`) and `DATETIME2` / `DATE` columns compare as before. Conditions on a `TIME` column, which errored on Lucee and BoxLang, now work on every engine ([#4327](https://github.com/wheels-dev/wheels/issues/4327)).
+
+### `withAdvisoryLock()` can throw `Wheels.AdvisoryLockReleaseFailed`
+
+On MySQL, PostgreSQL and SQL Server, `withAdvisoryLock()` now checks that the lock was released ([#4197](https://github.com/wheels-dev/wheels/issues/4197)). These locks belong to the pooled database session that took them, and on Lucee and BoxLang a busy pool can run the release on a different session, which frees nothing. Wheels retries the release for up to 5 seconds and then throws `Wheels.AdvisoryLockReleaseFailed`, naming the lock, if our session still holds it. The callback has already finished when this is thrown. If the callback itself threw, the failed release is logged instead and the callback's error is what you get. A lock left held stays held until that pooled connection closes, so other callers wait or time out on it. Before 4.2 this went unnoticed. The case is rare, but a scheduled job that relies on the lock should catch the exception and alert. Callers in the same application now also wait for each other, within `timeout`, before taking the database lock. To hold one connection for the whole call, which removes this case, pass `transaction = true` to `withAdvisoryLock()` ([#4198](https://github.com/wheels-dev/wheels/issues/4198)): it pins the lock, the callback, and the release to one connection inside a transaction (PostgreSQL, MySQL, and SQL Server; other databases throw). The callback then runs inside a transaction, so prefer it for short critical sections. On MySQL and SQL Server, `transaction = true` inside a transaction that is already open throws `Wheels.AdvisoryLockNotSupported`, because their lock would be released before the outer transaction commits: take the lock outside the transaction. PostgreSQL joins the open transaction and holds the lock until it ends.
+
+### `withAdvisoryLock()` works on SQL Server outside a transaction
+
+On SQL Server, `withAdvisoryLock()` called outside a transaction failed with "The statement or function must be executed in the context of a user transaction" ([#4220](https://github.com/wheels-dev/wheels/issues/4220)). The lock now belongs to the database session (`sp_getapplock @LockOwner = 'Session'`), as on MySQL and PostgreSQL, so it works anywhere, with the same release check. To identify which session holds a lock, Wheels reads `sys.dm_tran_locks`, which needs the `VIEW SERVER STATE` (SQL Server 2022: `VIEW SERVER PERFORMANCE STATE`) permission. Without it, a release waits until no session holds the lock, so it can report a failure in the rare case where another server takes the lock the moment ours is freed.
+
+### A tenant model's `withAdvisoryLock()` locks on the tenant database
+
+On MySQL and PostgreSQL, `withAdvisoryLock()` on a tenant (non-shared) model now takes the lock on the active tenant's datasource, the database its queries use ([#4223](https://github.com/wheels-dev/wheels/issues/4223)). 4.1 took it on the application's default datasource. SQL Server and `withAdvisoryLock(transaction = true)` already worked this way.
+
+The consequence: two tenants on different databases that use the same lock name no longer exclude each other, on one application server or across several. Each one gets its own lock. On MySQL, lock names are shared by every database on the same MySQL server, so tenant databases hosted on one MySQL server still exclude each other for the same name. If a lock must cover every tenant, call `withAdvisoryLock()` through a shared model (one with `sharedModel()` in its `config()`), which keeps the default datasource whichever tenant is active:
+
+```cfm
+model("Plan").withAdvisoryLock(name = "nightly-billing", callback = function() {
+    // runs once across all tenants
+});
+```
+
+Without a tenant datasource, nothing changes.
+
+### `LocalDisk` storage keys are checked per segment
+
+`LocalDisk` now validates an object key one path segment at a time ([#3912](https://github.com/wheels-dev/wheels/issues/3912)):
+
+- **Now accepted:** names with two dots inside a segment, such as `reports/q3..final.pdf` or `a..b.txt`. These used to be rejected because the key contained `..`.
+- **Now rejected** with `Wheels.Storage.InvalidKey`: a segment made only of dots and/or whitespace (`.`, `..`, `...`, `. .`, `.. `) and a drive-letter prefix (`C:/…`, `C:foo`).
+- **Normalised:** a leading `/`, a trailing `/`, a doubled `//` and a network-share prefix now become a relative key under the disk's root. Keys are never URL-decoded.
+
+If your app builds storage keys from user input or file names, check that none of them depend on the old behaviour.
+
+### `singularize()` corrects some `-ses` words
+
+`singularize()` now returns `psychoanalysis` for `psychoanalyses`, and likewise for any word that ends in `analyses` without starting with it ([#4187](https://github.com/wheels-dev/wheels/issues/4187)). 4.1 returned the misspelling `psychoanalyasis`. `singularize("databases")` now returns `database` rather than `databasis`, so `Databases` and `userDatabases` give `Database` and `userDatabase` ([#4189](https://github.com/wheels-dev/wheels/issues/4189)).
+
+`analyses`, `bases`, `cases`, `diagnoses`, `parentheses`, `phases`, `prognoses`, `purchases`, `synopses`, `theses` and `vases` are unchanged. Wheels derives model and table names with `singularize()` and `pluralize()`, so check any name you derived from such a word. A model class or table named after the old `databasis` output needs renaming.
+
+### `insertAll()` and `upsertAll()` run in one transaction
+
+`insertAll()` and `upsertAll()` now honour their `transaction` argument, which defaults to your `transactionMode` setting (`commit` unless you changed it). Records are still written in batches of up to 1000 rows (fewer on SQL Server, to stay within its parameter limit), but all the batches now run in one transaction: a large import is all-or-nothing, and a failing batch rolls back the ones before it. In 4.1 each batch committed on its own. If you relied on that, for example to keep a partial import, pass `transaction="none"`. `transaction="rollback"` writes nothing, like `save(transaction="rollback")`. One transaction holds its locks until the end, so an import of many thousands of rows holds them for the whole call.
+
+### Soft-deleting a parent leaves non-soft-delete dependents alone
+
+On a model with a soft-delete column (`deletedAt`), a soft `delete()` no longer runs `dependent=` actions that a restore couldn't undo ([#4370](https://github.com/wheels-dev/wheels/issues/4370)). Children whose model also has a soft-delete column are soft-deleted, as before. Children without one are left alone: `dependent="delete"` / `"deleteAll"` no longer hard-deletes them, and `dependent="remove"` / `"removeAll"` no longer sets their foreign keys to `NULL`. On a soft delete, `dependent=` therefore applies only to a real delete. If an app counted on a soft delete removing such children, delete them in a `beforeDelete` / `afterDelete` callback, or delete the parent with `softDelete=false`.
+
+### `softDelete=false` also deletes rows that are already soft-deleted
+
+`delete(softDelete=false)`, `deleteAll(softDelete=false)`, `deleteOne(softDelete=false)` and `deleteByKey(softDelete=false)` are now always real deletes, including rows that were soft-deleted earlier and the `dependent=` children of a deleted record ([#4371](https://github.com/wheels-dev/wheels/issues/4371)). In 4.1 they skipped soft-deleted rows unless `includeSoftDeletes=true` was passed too. An explicit `includeSoftDeletes=false` alongside `softDelete=false` no longer keeps soft-deleted rows. With `instantiate=true`, `deleteAll(softDelete=false)` now loads those rows and runs their `beforeDelete`, `afterDelete` and `afterCommit` callbacks too.
+
+### `reload()` and `delete()` on a soft-deleted object
+
+Three changes for an object whose row is soft-deleted ([#4372](https://github.com/wheels-dev/wheels/issues/4372)):
+
+- `reload()` reloads the soft-deleted row. In 4.1 it blanked every property. When the row is gone altogether, `reload()` now throws `Wheels.RecordNotFound` instead of blanking the object; uncaught in an action, that error renders the 404 page.
+- A soft `delete()` on an object that is already soft-deleted, or on a stale copy of a row soft-deleted elsewhere, returns `false` and changes nothing. In 4.1 it wrote a new `deletedAt` and returned `true`.
+- After a soft `delete()`, the object's `deletedAt` holds the timestamp written. If the delete is rolled back, it goes back to what it was.
+
+## CLI and deployment changes
+
+### Dev servers listen on `127.0.0.1`
+
+`wheels start` and `wheels server run` (LuCLI 0.6.2.2) listen on `127.0.0.1`, so a dev server is reachable only from your own machine. To reach it from a phone, a VM or another computer, start it with `--host 0.0.0.0` or set `"bindAddress": "0.0.0.0"` in `lucee.json`. Clients that resolve `localhost` only to `::1` need `http://127.0.0.1:<port>/`.
+
+### `wheels generate` and `wheels destroy` need a project
+
+Both refuse to run outside a Wheels project (`Wheels.NotAWheelsProject`, non-zero exit) instead of writing or deleting files in the current directory ([#3909](https://github.com/wheels-dev/wheels/issues/3909)). `wheels generate app` still works anywhere.
+
+### Generated model columns are required by default
+
+`wheels generate model` and `wheels generate scaffold` now create each unmarked `name:type` column as `allowNull=false` and add it to `validatesPresenceOf`, so the model and its migration agree ([#4285](https://github.com/wheels-dev/wheels/pull/4285)). In 4.1 every column was validated for presence while the migration made it nullable. Mark a column nullable with `name:type:optional`, or give it a default with `name:type=value`; neither is added to `validatesPresenceOf`. Models you already generated are unchanged. Update scripts that generate models if some of their columns should stay nullable.
+
+### App creation is CLI-only over MCP
+
+The stdio MCP server (`wheels mcp wheels`) no longer offers `create`, and refuses `generate` with `type=app` ([#3910](https://github.com/wheels-dev/wheels/issues/3910), [#3980](https://github.com/wheels-dev/wheels/issues/3980)). Run `wheels new <name>` in a terminal.
+
+### `wheels deploy` changes
+
+From [#3914](https://github.com/wheels-dev/wheels/issues/3914), [#3925](https://github.com/wheels-dev/wheels/issues/3925) and [#4018](https://github.com/wheels-dev/wheels/issues/4018):
+
+- **Images ship an empty `db/`.** The `wheels deploy init` Dockerfile no longer copies local SQLite files (`db/*.sqlite`, `*.sqlite3`, `*.db` and their journal files) into the image, and its `.dockerignore` excludes them. Migrations ship with `app/migrator/migrations` as before. A SQLite app therefore starts production with an empty database inside the container, and `deploy init` now says so for a SQLite app: run migrations on boot with `set(autoMigrateDatabase=true)` in `config/production/settings.cfm`. `deploy init` keeps an existing `.dockerignore`, so for an app scaffolded earlier the Dockerfile's builder stage removes those files instead. To adopt the new `.dockerignore` and Dockerfile, run `wheels deploy init` in a scratch directory and copy the changes over. Don't run `--force` in your app: it also overwrites your `config/deploy.yml`.
+- **`proxy:` keys are checked.** Only `host`, `ssl`, `app_port`, `healthcheck`, `forward_headers` and `buffering` are accepted, and `proxy.ssl` must be `true` or `false`. A config with a misspelled proxy key, or `ssl: yes`, now fails validation instead of being ignored.
+- **`deploy registry login` needs `registry.username`,** and a missing or empty `config/deploy.yml` now says so instead of a file-read error.
+- **`deploy app details`, `app live` and `app maintenance` no longer need `--release`.** Without it, `app details` lists the role's containers.
+- **The `boot:` block is applied** ([#3925](https://github.com/wheels-dev/wheels/issues/3925)). With a `boot:` block, each role's hosts boot in batches of `limit` (a count, or a percentage of the role's hosts) with `wait` seconds between batches. In 4.1 it was validated but ignored, so a config that carries one now deploys more slowly by design. Without a `boot:` block, hosts boot back to back as before.
+- **App containers can mount `volumes:`.** A top-level `volumes:` list (Kamal's `host:container` or `host:container:ro|rw` format) is mounted on every app container. For a SQLite app, mounting `db/` from the host (`/var/lib/<service>/db:/var/www/db`) keeps the database across redeploys, and `deploy init` now shows that entry. See the [config reference](/v4-2-0/deployment/config-reference/#volumes).
+- **Breaking: an accessory `port:` must name a bind address** ([#4067](https://github.com/wheels-dev/wheels/issues/4067)). A bare `port: 5432`, or `"5432:5432"`, now fails validation. In 4.1 it went to `docker run --publish` as written, which published on a random host port (bare) or on every interface (`5432:5432`). Write `"<address>:<host port>:<container port>"`: `"10.0.0.20:5432:5432"` for a private network address, `"127.0.0.1:5432:5432"` for the host only, or `"0.0.0.0:5432:5432"` to publish it on every interface.
+- **Volume host paths are passed as written.** Accessory `volumes:` / `directories:` arguments are now quoted like the other docker arguments, so paths with spaces or special characters work. In 4.1 they went through the remote shell unquoted, so a `~` or `$VAR` at the start of a host path happened to expand there. It isn't expanded any more, and a host path starting with `~` or `$` now fails validation with `… needs an absolute host path`. Write absolute paths: `/home/deploy/data:/data`, not `~/data:/data`.
+- **New `migrate:` step** ([#4063](https://github.com/wheels-dev/wheels/issues/4063)). `migrate: true` in `config/deploy.yml` migrates on one host per deploy and turns migration at start off on the others; see [`migrate`](/v4-2-0/deployment/config-reference/#migrate). The framework adds `set(migrateOnBoot=true)` (migrate strictly at start) and honours a `WHEELS_MIGRATE_ON_BOOT` environment variable, which overrides `autoMigrateDatabase` when set: if your environment already sets that name for something else, rename it.
+- **`deploy config` prints the whole resolved config** (proxy, env, volumes, accessories, ssh, builder). A `registry.password` entry is shown only when it names a key in `.kamal/secrets`.
+
+## Verify
+
+<Steps>
+
+1. Restart the server (`wheels stop`, then `wheels start`) and confirm the app starts clean; check `wheels.log` for warnings.
+2. Run your suite (`/wheels/app/tests`), including the model specs that cover conditional validations.
+3. On a production server, confirm the app runs in production mode: an error must not show a stack trace.
+4. Behind a reverse proxy, confirm absolute URLs (for example in emails or redirects) still start with `https://`.
+5. If you render XML or other byte-exact responses, confirm nothing comes before the first byte.
+
+</Steps>
+
+## Related guides
+
+- [Manual upgrades](/v4-2-0/upgrading/manual-upgrades/) — the swap mechanics.
+- [Upgrading from 4.0 to 4.1](/v4-2-0/upgrading/4x-0-to-4x-1/) — the earlier `public/Application.cfc` edits, if you are coming from 4.0.
+- [Changelog](/v4-2-0/upgrading/changelog/) — the full per-version entry list.

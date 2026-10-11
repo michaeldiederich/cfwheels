@@ -187,6 +187,9 @@
 				$combineArguments(args = arguments.args, combine = "#local.first#,#local.second#", required = local.required);
 			}
 		}
+		if ($strictArgumentsMode() != "off" && Len($strictArgumentsSource(arguments.name))) {
+			$checkArguments(args = arguments.args, name = arguments.name, accepted = $strictArgumentsAccepted(arguments.name));
+		}
 		if ($get("showErrorInformation")) {
 			if (ListLen(arguments.reserved)) {
 				local.iEnd = ListLen(arguments.reserved);
@@ -222,9 +225,295 @@
 	}
 
 
+	/**
+	 * Internal function. The `strictArguments` setting: "warn", "throw" or "off" (also for any
+	 * other value, or before the setting exists).
+	 */
+	public string function $strictArgumentsMode() {
+		if (
+			!StructKeyExists(application, "wheels")
+			|| !StructKeyExists(application.wheels, "strictArguments")
+			|| !IsSimpleValue(application.wheels.strictArguments)
+		) {
+			return "off";
+		}
+		local.rv = LCase(application.wheels.strictArguments);
+		return ListFind("warn,throw", local.rv) ? local.rv : "off";
+	}
+
+	/**
+	 * Internal function. The framework functions whose arguments `strictArguments` checks, and
+	 * where each is declared: "model" (the `wheels.Model` surface), a component path, or "" for a
+	 * function that isn't checked. These take a fixed set of arguments. Functions that turn unknown
+	 * arguments into something (property values, route params, HTML attributes, view variables,
+	 * filter arguments) aren't checked.
+	 */
+	public string function $strictArgumentsSource(required string name) {
+		local.modelFunctions = "belongsTo,hasMany,hasOne,nestedProperties,property,table,"
+			& "validate,validateOnCreate,validateOnUpdate,validatesConfirmationOf,validatesExclusionOf,"
+			& "validatesFormatOf,validatesInclusionOf,validatesLengthOf,validatesNumericalityOf,"
+			& "validatesPresenceOf,validatesUniquenessOf,afterNew,afterFind,afterInitialization,"
+			& "beforeValidation,beforeValidationOnCreate,beforeValidationOnUpdate,afterValidation,"
+			& "afterValidationOnCreate,afterValidationOnUpdate,beforeSave,afterSave,beforeCreate,afterCreate,"
+			& "beforeUpdate,afterUpdate,beforeDelete,afterDelete,afterCommit,afterRollback,"
+			& "findAll,findOne,findByKey,findFirst,findLastOne";
+		if (ListFindNoCase(local.modelFunctions, arguments.name)) {
+			return "model";
+		}
+		local.controllerFunctions = {
+			caches = "wheels.controller.caching",
+			protectsFromForgery = "wheels.controller.csrf",
+			provides = "wheels.controller.provides",
+			usesLayout = "wheels.controller.layouts"
+		};
+		if (StructKeyExists(local.controllerFunctions, arguments.name)) {
+			return local.controllerFunctions[arguments.name];
+		}
+		return "";
+	}
+
+	/**
+	 * Internal function. Arguments a checked function takes without declaring them. findAll() reads
+	 * `returnType` and `keyColumn` (native query options), the other finders pass everything on to
+	 * findAll(), and aliases resolved later (`property` for `properties`) count too.
+	 */
+	public string function $strictArgumentsAccepted(required string name) {
+		switch (arguments.name) {
+			case "findAll":
+				return "returnType,keyColumn";
+			case "findOne": case "findByKey": case "findFirst":
+				return ListAppend($declaredArgumentNames("findAll"), "returnType,keyColumn");
+			case "findLastOne":
+				return ListAppend($declaredArgumentNames("findAll"), "returnType,keyColumn,properties");
+		}
+		// the validations also take `property` for `properties`
+		if (Left(arguments.name, 9) == "validates") {
+			return "property";
+		}
+		return "";
+	}
+
+	/**
+	 * Internal function. The declared parameter names of a checked framework function, as a list,
+	 * read from the framework's own definition (so an app override doesn't change it) and cached
+	 * for the application's lifetime. Empty when the metadata can't be read: then nothing is
+	 * checked, rather than guessed.
+	 */
+	public string function $declaredArgumentNames(required string name) {
+		if (!StructKeyExists(application.wheels, "$strictArgumentsDeclared")) {
+			application.wheels.$strictArgumentsDeclared = {};
+		}
+		if (!StructKeyExists(application.wheels.$strictArgumentsDeclared, arguments.name)) {
+			try {
+				application.wheels.$strictArgumentsDeclared[arguments.name] = $readDeclaredArgumentNames(arguments.name);
+			} catch (any e) {
+				application.wheels.$strictArgumentsDeclared[arguments.name] = "";
+			}
+		}
+		return application.wheels.$strictArgumentsDeclared[arguments.name];
+	}
+
+	/**
+	 * Internal function. Reads [see:$declaredArgumentNames] from the component that declares the
+	 * function: a bare `wheels.Model` for model functions, the controller component otherwise.
+	 */
+	public string function $readDeclaredArgumentNames(required string name) {
+		local.source = $strictArgumentsSource(arguments.name);
+		if (local.source == "model") {
+			if (!StructKeyExists(application.wheels, "modelSuperPrototype")) {
+				application.wheels.modelSuperPrototype = CreateObject("component", "wheels.Model");
+			}
+			local.owner = application.wheels.modelSuperPrototype;
+		} else if (Len(local.source)) {
+			local.owner = CreateObject("component", local.source);
+		} else {
+			return "";
+		}
+		if (!StructKeyExists(local.owner, arguments.name) || !IsCustomFunction(local.owner[arguments.name])) {
+			return "";
+		}
+		local.fn = local.owner[arguments.name];
+		local.rv = "";
+		for (local.parameter in GetMetadata(local.fn).parameters) {
+			local.rv = ListAppend(local.rv, local.parameter.name);
+		}
+		return local.rv;
+	}
+
+	/**
+	 * Internal function. With `strictArguments` set to "warn" or "throw", reports each argument in
+	 * `args` that `name` doesn't declare: positional and `$`-prefixed (internal) keys and the names
+	 * in `accepted` are allowed. "warn" writes one `wheels.log` warning per class, function and
+	 * argument for the application's lifetime; "throw" raises `Wheels.UnknownArgument`.
+	 * `declared` replaces the function's metadata when given.
+	 */
+	public void function $checkArguments(
+		required struct args,
+		required string name,
+		string accepted = "",
+		string declared = "",
+		string label = ""
+	) {
+		local.mode = $strictArgumentsMode();
+		if (local.mode == "off") {
+			return;
+		}
+		local.known = Len(arguments.declared) ? arguments.declared : $declaredArgumentNames(arguments.name);
+		if (!Len(local.known)) {
+			return;
+		}
+		local.known = ListAppend(local.known, arguments.accepted);
+		for (local.key in arguments.args) {
+			// A declared parameter that wasn't passed can still be iterated (Lucee), as a null.
+			if (!StructKeyExists(arguments.args, local.key)) {
+				continue;
+			}
+			if (IsNumeric(local.key) || Left(local.key, 1) == "$" || ListFindNoCase(local.known, local.key)) {
+				continue;
+			}
+			$reportUnknownArgument(
+				name = Len(arguments.label) ? arguments.label : arguments.name,
+				argumentName = local.key,
+				known = local.known,
+				mode = local.mode,
+				family = arguments.name
+			);
+		}
+	}
+
+	/**
+	 * Internal function. Logs or throws one unknown argument for [see:$checkArguments].
+	 */
+	public void function $reportUnknownArgument(
+		required string name,
+		required string argumentName,
+		required string known,
+		required string mode,
+		string family = ""
+	) {
+		local.owner = $strictArgumentsOwner();
+		local.message = "`#arguments.name#()`" & (Len(local.owner) ? " on `#local.owner#`" : "")
+			& " got an argument it doesn't know: `#arguments.argumentName#`. Unknown arguments are ignored.";
+		local.suggestion = $suggestArgumentName(arguments.argumentName, arguments.known);
+		if (Len(local.suggestion)) {
+			local.message &= " Did you mean `#local.suggestion#`?";
+		}
+		if (ListFindNoCase("findAll,findOne,findByKey,findFirst,findLastOne", Len(arguments.family) ? arguments.family : arguments.name)) {
+			local.message &= " If a model method overriding a finder passes its own arguments on (argumentCollection = arguments), remove them first with StructDelete().";
+		}
+		if (arguments.mode == "throw") {
+			Throw(
+				type = "Wheels.UnknownArgument",
+				message = local.message,
+				extendedInfo = "Arguments it knows: #Replace(arguments.known, ",", ", ", "all")#. Set `strictArguments` to ""warn"" or ""off"" to allow it."
+			);
+		}
+		if (!StructKeyExists(application.wheels, "$strictArgumentsSeen")) {
+			application.wheels.$strictArgumentsSeen = {};
+		}
+		// The finders pass their arguments on to each other, so an unknown one is reported once, by
+		// the finder the app called (it checks first).
+		local.family = Len(arguments.family) ? arguments.family : arguments.name;
+		if (ListFindNoCase("findAll,findOne,findByKey,findFirst,findLastOne", local.family)) {
+			local.family = "finder";
+		}
+		local.seenKey = local.owner & "|" & local.family & "|" & arguments.argumentName;
+		if (StructKeyExists(application.wheels.$strictArgumentsSeen, local.seenKey)) {
+			return;
+		}
+		// Argument names can come from a request (argumentCollection = params), so the record of
+		// what was logged is capped: past the cap, one last line says logging stopped.
+		if (StructCount(application.wheels.$strictArgumentsSeen) >= $strictArgumentsSeenCap()) {
+			if (!StructKeyExists(application.wheels, "$strictArgumentsCapped")) {
+				application.wheels.$strictArgumentsCapped = true;
+				writeLog(
+					file = "wheels",
+					type = "warning",
+					text = "Wheels: strictArguments has logged #$strictArgumentsSeenCap()# unknown arguments and stops logging new ones until the application reloads. Check for argumentCollection = params passed to a framework function."
+				);
+			}
+			return;
+		}
+		application.wheels.$strictArgumentsSeen[local.seenKey] = true;
+		writeLog(file = "wheels", type = "warning", text = "Wheels: " & local.message);
+	}
+
+	/**
+	 * Internal function. How many distinct unknown arguments "warn" logs before it stops.
+	 */
+	public numeric function $strictArgumentsSeenCap() {
+		return 500;
+	}
+
+	/**
+	 * Internal function. The model or controller the checked call configures, for the message.
+	 */
+	public string function $strictArgumentsOwner() {
+		if (StructKeyExists(variables, "wheels") && IsStruct(variables.wheels) && StructKeyExists(variables.wheels, "class")) {
+			if (StructKeyExists(variables.wheels.class, "modelName")) {
+				return variables.wheels.class.modelName;
+			}
+		}
+		if (StructKeyExists(variables, "$class") && IsStruct(variables.$class) && StructKeyExists(variables.$class, "name")) {
+			return variables.$class.name;
+		}
+		return ListLast(GetMetadata(this).name, ".");
+	}
+
+	/**
+	 * Internal function. A known argument name that `argumentName` probably meant: the same name
+	 * ignoring case, underscores and dashes, or a common name from other frameworks. Empty when
+	 * there is no likely match.
+	 */
+	public string function $suggestArgumentName(required string argumentName, required string known) {
+		local.aliases = {
+			"null" = "allowNull",
+			"nullable" = "allowNull",
+			"classname" = "modelName",
+			"class" = "modelName",
+			"orderby" = "order",
+			"sort" = "order",
+			"limit" = "maxRows",
+			"includes" = "include",
+			"joins" = "include"
+		};
+		local.normalized = LCase(ReReplace(arguments.argumentName, "[_\-]", "", "all"));
+		for (local.candidate in ListToArray(arguments.known)) {
+			if (LCase(ReReplace(local.candidate, "[_\-]", "", "all")) == local.normalized) {
+				return local.candidate;
+			}
+		}
+		// singular for plural and the other way round (method / methods)
+		for (local.variant in [arguments.argumentName & "s", ReReplaceNoCase(arguments.argumentName, "s$", "")]) {
+			local.position = ListFindNoCase(arguments.known, local.variant);
+			if (local.position) {
+				return ListGetAt(arguments.known, local.position);
+			}
+		}
+		if (StructKeyExists(local.aliases, local.normalized)) {
+			local.position = ListFindNoCase(arguments.known, local.aliases[local.normalized]);
+			if (local.position) {
+				return ListGetAt(arguments.known, local.position);
+			}
+		}
+		return "";
+	}
+
 	// ======================================================================
 	// MISC FUNCTIONS
 	// ======================================================================
+
+	/**
+	 * The platform's native path separator, for path-containment normalisation (folds only
+	 * real native separators, never a backslash seen in a POSIX filename). This Global mixin
+	 * is reachable from mixed-in code (tags.cfm, Public.cfc); it delegates to
+	 * wheels.PathGuard.$nativeSeparator() so the detection lives in exactly one place rather
+	 * than being duplicated here. (PathGuard is a standalone component with no Global mixins,
+	 * so the dependency only goes this direction.)
+	 */
+	public string function $nativePathSeparator() {
+		return new wheels.PathGuard().$nativeSeparator();
+	}
 
 	/**
 	 * Call CFML's canonicalize() function but set to blank string if the result is null (happens on Lucee 5).
@@ -292,8 +581,10 @@
 			try {
 				return $javaCalendarToDate($epochMillisCalendar(JavaCast("long", arguments.value)));
 			} catch (any e) {
-				// JVM-free engine (RustCFML) — plain epoch arithmetic instead.
-				return DateAdd("s", Int(arguments.value / 1000), CreateDate(1970, 1, 1));
+				// JVM-free engine (RustCFML) — plain epoch arithmetic instead,
+				// counted from the epoch instant in local time. CreateDate(1970, 1, 1)
+				// is local midnight, which is off by the host's 1970 UTC offset (#4525).
+				return DateAdd("s", Int(arguments.value / 1000), DateConvert("utc2local", CreateDateTime(1970, 1, 1, 0, 0, 0)));
 			}
 		}
 		// Datetime strings, including the fractional-second form
@@ -923,6 +1214,46 @@
 	}
 
 
+	// Integer-literal helpers shared by models (nested-property keys, #4128) and database
+	// adapters (SQLite bind width, #4089): compared as digit strings, never through a double.
+
+	/**
+	 * Internal function. "<sign><digits>" with no leading zeros for an integer literal, or ""
+	 * when the value is not one.
+	 */
+	public string function $canonicalIntegerString(required string value) {
+		local.value = Trim(arguments.value);
+		if (!ReFind("^[+-]?[0-9]+$", local.value)) {
+			return "";
+		}
+		local.sign = Left(local.value, 1) == "-" ? "-" : "";
+		local.digits = ReReplace(local.value, "^[+-]?0*", "");
+		if (!Len(local.digits)) {
+			return "0";
+		}
+		return local.sign & local.digits;
+	}
+
+	/**
+	 * Internal function. -1, 0 or 1 as canonical integer string a is below, equal to or above b,
+	 * compared by sign, then length, then digits.
+	 */
+	public numeric function $compareIntegerStrings(required string a, required string b) {
+		local.aNegative = Left(arguments.a, 1) == "-";
+		local.bNegative = Left(arguments.b, 1) == "-";
+		if (local.aNegative != local.bNegative) {
+			return local.aNegative ? -1 : 1;
+		}
+		local.aDigits = ReReplace(arguments.a, "^-", "");
+		local.bDigits = ReReplace(arguments.b, "^-", "");
+		if (Len(local.aDigits) != Len(local.bDigits)) {
+			local.rv = Len(local.aDigits) > Len(local.bDigits) ? 1 : -1;
+		} else {
+			local.rv = Sgn(Compare(local.aDigits, local.bDigits));
+		}
+		return local.aNegative ? -local.rv : local.rv;
+	}
+
 	/**
 	 * Generates a 36-character UUID compatible with SQL Server's uniqueidentifier.
 	 *
@@ -932,8 +1263,42 @@
 	 * @return A valid 36-character UUID string (e.g., 123e4567-e89b-12d3-a456-426614174000)
 	 */
 	public string function generateUUID() {
-		// Use Java UUID generator for a 36-character format
-		return CreateObject("java", "java.util.UUID").randomUUID().toString();
+		// Java's version 4 UUID where the JVM provides one. The result is checked, not trusted:
+		// RustCFML answers CreateObject("java", "java.util.UUID") with a zero-filled value rather
+		// than an error. CreateUUID() is not used: it returns a 35-character 8-4-4-16 string.
+		local.candidate = "";
+		try {
+			local.candidate = LCase(CreateObject("java", "java.util.UUID").randomUUID().toString());
+		} catch (any e) {
+			// no JVM UUID; use the fallback below
+		}
+		if (ReFind("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", local.candidate)) {
+			return local.candidate;
+		}
+		return $randomUuidV4();
+	}
+
+	/**
+	 * Internal function. A version 4 UUID (8-4-4-4-12, lowercase) built from 16 bytes of
+	 * GenerateSecretKey(), a cryptographically strong source on every supported engine, unlike
+	 * RandRange()/Rand(), whose generator is seedable (RustCFML ignores their algorithm
+	 * argument). Throws when no strong source is available rather than returning a weak value.
+	 */
+	public string function $randomUuidV4() {
+		try {
+			local.hex = LCase(BinaryEncode(BinaryDecode(GenerateSecretKey("AES", 128), "base64"), "hex"));
+		} catch (any e) {
+			Throw(
+				type = "Wheels.NoSecureRandom",
+				message = "generateUUID() needs a cryptographically strong random source, and none is available on this engine.",
+				extendedInfo = e.message
+			);
+		}
+		if (Len(local.hex) != 32) {
+			Throw(type = "Wheels.NoSecureRandom", message = "generateUUID() could not read 16 random bytes on this engine.");
+		}
+		local.variant = FormatBaseN(8 + (InputBaseN(Mid(local.hex, 17, 1), 16) MOD 4), 16);
+		return Mid(local.hex, 1, 8) & "-" & Mid(local.hex, 9, 4) & "-4" & Mid(local.hex, 14, 3) & "-" & local.variant & Mid(local.hex, 18, 3) & "-" & Mid(local.hex, 21, 12);
 	}
 
 
@@ -992,4 +1357,466 @@
 		local.norm = ReReplace(local.norm, "^\.", "", "one");
 		return local.norm;
 	}
+
+/**
+ * True when the engine can open the named datasource. The app test
+ * runner checks this before refusing a missing `<datasource>_test`, because a
+ * datasource registered at server level (the Lucee admin, `lucee.json`
+ * `configuration.datasources`, the CF Administrator, CommandBox cfconfig) is
+ * not listed in GetApplicationMetaData().datasources. Any failure, including
+ * an engine whose cfdbinfo can't answer, means "not reachable", so the runner
+ * still fails closed. Only the named datasource is touched.
+ */
+public boolean function $dataSourceIsReachable(required string name) {
+	var state = {reachable = false};
+	if (!Len(Trim(arguments.name))) {
+		return false;
+	}
+	try {
+		$dbinfo(type = "version", datasource = arguments.name);
+		state.reachable = true;
+	} catch (any e) {
+		state.reachable = false;
+	}
+	return state.reachable;
+}
+
+/**
+ * Internal. Which datasource an app test run may use, by the same rules as the
+ * built-in runner (`vendor/wheels/tests/app-runner.cfm`):
+ * - an explicit, valid `useTestDB=false` runs on the primary datasource (intentional);
+ * - otherwise `<primary>_test` is used when it is registered or reachable ("swap");
+ * - otherwise an omitted `useTestDB` with `allowTestsAgainstPrimaryDatasource=true`
+ *   runs on the primary datasource with a warning;
+ * - anything else is refused.
+ * Returns `{action: swap|primary|refuse, primary, candidate, target, warn}`.
+ * `candidateRegistered` is probed when not passed (passed by specs).
+ */
+public struct function $testDataSourceDecision(
+	required string primary,
+	required struct requestUrl,
+	candidateRegistered
+) {
+	local.rv = {
+		action = "refuse",
+		primary = arguments.primary,
+		candidate = arguments.primary & "_test",
+		target = "",
+		warn = false
+	};
+	local.paramPresent = StructKeyExists(arguments.requestUrl, "useTestDB");
+	local.validBoolean = local.paramPresent && IsBoolean(arguments.requestUrl.useTestDB);
+	if (local.validBoolean && !arguments.requestUrl.useTestDB) {
+		local.rv.action = "primary";
+		local.rv.target = arguments.primary;
+		return local.rv;
+	}
+	if (!StructKeyExists(arguments, "candidateRegistered") || IsNull(arguments.candidateRegistered)) {
+		arguments.candidateRegistered = $testDataSourceRegistered(local.rv.candidate);
+	}
+	if (arguments.candidateRegistered) {
+		local.rv.action = "swap";
+		local.rv.target = local.rv.candidate;
+		return local.rv;
+	}
+	local.allowPrimary = StructKeyExists(application.wheels, "allowTestsAgainstPrimaryDatasource")
+		&& IsBoolean(application.wheels.allowTestsAgainstPrimaryDatasource)
+		&& application.wheels.allowTestsAgainstPrimaryDatasource;
+	if (!local.paramPresent && local.allowPrimary) {
+		local.rv.action = "primary";
+		local.rv.target = arguments.primary;
+		local.rv.warn = true;
+	}
+	return local.rv;
+}
+
+/**
+ * Internal. True when this request belongs to the app test run in progress: it carries
+ * that run's token (`wheelsTestRun`). Such a request runs inside the run, so it must not
+ * wait on the runner lock the run holds, nor swap or restore the datasource again.
+ */
+public boolean function $isTestRunReentry(required struct requestUrl) {
+	local.activeRunToken = StructKeyExists(application, "$$$appTestRunToken") ? application["$$$appTestRunToken"] : "";
+	local.requestRunToken = (StructKeyExists(arguments.requestUrl, "wheelsTestRun") && IsSimpleValue(arguments.requestUrl.wheelsTestRun))
+		? arguments.requestUrl.wheelsTestRun
+		: "";
+	return Len(local.activeRunToken) > 0 && Compare(local.requestRunToken, local.activeRunToken) == 0;
+}
+
+/**
+ * Internal. Defaults `coreTestDataSourceName` to `dataSourceName` when the settings did not
+ * set it. onApplicationStart calls it after the settings files load, so the default follows
+ * the dataSourceName they set rather than the one derived from the app's folder before them.
+ */
+public void function $defaultCoreTestDataSourceName(required struct settings) {
+	if (!StructKeyExists(arguments.settings, "coreTestDataSourceName")) {
+		arguments.settings.coreTestDataSourceName = arguments.settings.dataSourceName;
+	}
+}
+
+/**
+ * Internal. Which datasource the framework's own test runners (the core runner and the
+ * RocketUnit runner) use. `?db=` naming one of `testDbList` selects `wheelstestdb_<db>`, and
+ * the `|datasourceName|` placeholder selects `wheelstestdb`, as before. A
+ * `coreTestDataSourceName` other than the app's primary datasource is used as it is when it
+ * exists, and refused when it does not. Only
+ * when the run would otherwise use the app's primary datasource does the app-test rule apply
+ * ($testDataSourceDecision): `<primary>_test`, the primary datasource only for an explicit
+ * useTestDB=false (never through allowTestsAgainstPrimaryDatasource), or refused.
+ * Returns `{action: use|swap|primary|refuse, target, decision, message}`; `message` explains a
+ * refusal.
+ */
+public struct function $coreTestDataSource(
+	required string primary,
+	required string coreName,
+	required struct requestUrl,
+	string testDbList = "mysql,sqlserver,sqlserver_cicd,postgres,h2,oracle,sqlite,cockroachdb",
+	candidateRegistered,
+	targetRegistered
+) {
+	local.rv = {action = "use", target = "", decision = {}, ignoredAllowPrimary = false, message = ""};
+	if (
+		StructKeyExists(arguments.requestUrl, "db")
+		&& IsSimpleValue(arguments.requestUrl.db)
+		&& ListFind(arguments.testDbList, arguments.requestUrl.db)
+	) {
+		local.rv.target = ListFind("sqlserver,sqlserver_cicd", arguments.requestUrl.db) ? "wheelstestdb_sqlserver" : "wheelstestdb_" & arguments.requestUrl.db;
+		return local.rv;
+	}
+	if (arguments.coreName == "|datasourceName|") {
+		local.rv.target = "wheelstestdb";
+		return local.rv;
+	}
+	// Datasource names are case-insensitive: 'App' is the primary 'app', not another datasource.
+	if (CompareNoCase(arguments.coreName, arguments.primary) != 0) {
+		local.registered = (StructKeyExists(arguments, "targetRegistered") && !IsNull(arguments.targetRegistered))
+			? arguments.targetRegistered
+			: $testDataSourceRegistered(name = arguments.coreName);
+		if (!local.registered) {
+			local.rv.action = "refuse";
+			local.rv.decision = {primary = arguments.primary, candidate = arguments.coreName};
+			local.rv.message = "The framework test suite is set to use the datasource '" & arguments.coreName
+				& "' (coreTestDataSourceName), which does not exist. Set coreTestDataSourceName in config/settings.cfm, create '"
+				& arguments.coreName & "', or pass ?db= to use a wheelstestdb_<db> datasource.";
+			return local.rv;
+		}
+		local.rv.target = arguments.coreName;
+		return local.rv;
+	}
+	local.decisionArgs = {primary = arguments.primary, requestUrl = arguments.requestUrl};
+	if (StructKeyExists(arguments, "candidateRegistered") && !IsNull(arguments.candidateRegistered)) {
+		local.decisionArgs.candidateRegistered = arguments.candidateRegistered;
+	}
+	local.rv.decision = $testDataSourceDecision(argumentCollection = local.decisionArgs);
+	// allowTestsAgainstPrimaryDatasource is a compatibility setting for app tests from
+	// older CLIs. The framework's suite (and its populate.cfm, which drops and recreates
+	// tables) never uses it: only an explicit useTestDB=false reaches the primary.
+	if (local.rv.decision.action == "primary" && local.rv.decision.warn) {
+		local.rv.decision.action = "refuse";
+		local.rv.decision.warn = false;
+		local.rv.ignoredAllowPrimary = true;
+		try {
+			WriteLog(
+				file = "wheels",
+				type = "warning",
+				text = "The framework test suite ignores allowTestsAgainstPrimaryDatasource: it does not run on the primary datasource '" & arguments.primary & "' unless the request passes useTestDB=false."
+			);
+		} catch (any e) {
+		}
+	}
+	local.rv.action = local.rv.decision.action;
+	local.rv.target = local.rv.decision.action == "refuse" ? "" : local.rv.decision.target;
+	if (local.rv.action == "refuse") {
+		local.rv.message = "The framework test suite would run on this app's primary datasource '" & local.rv.decision.primary
+			& "'. Pass ?db= to use a wheelstestdb_<db> datasource, create '" & local.rv.decision.candidate
+			& "', or run against the primary datasource intentionally with useTestDB=false.";
+	}
+	return local.rv;
+}
+
+/**
+ * Internal. True when `name` is in the application's datasources or the engine can
+ * open it (a datasource registered at server level is not in the application metadata).
+ */
+public boolean function $testDataSourceRegistered(required string name) {
+	local.meta = GetApplicationMetaData();
+	if (
+		StructKeyExists(local.meta, "datasources")
+		&& IsStruct(local.meta.datasources)
+		&& StructKeyExists(local.meta.datasources, arguments.name)
+	) {
+		return true;
+	}
+	return $dataSourceIsReachable(name = arguments.name);
+}
+
+/**
+ * Internal. Points a project test runner (`tests/runner.cfm`) at the datasource
+ * `decision` chose and returns what to restore with `$endTestRunDataSource()`.
+ * Runners copied from older Wheels releases set `dataSourceName` from
+ * `coreTestDataSourceName`, so both are pointed at the test datasource. Records the
+ * run's token (so re-entrant requests from the run skip the runner lock) and the swap
+ * markers $recoverStrandedTestRun() uses if the run dies before it restores.
+ */
+public struct function $beginTestRunDataSource(required struct decision) {
+	local.saved = {
+		dataSourceName = application.wheels.dataSourceName,
+		hasCoreTestDataSourceName = StructKeyExists(application.wheels, "coreTestDataSourceName"),
+		coreTestDataSourceName = StructKeyExists(application.wheels, "coreTestDataSourceName") ? application.wheels.coreTestDataSourceName : ""
+	};
+	if (!StructKeyExists(request, "wheels")) {
+		request.wheels = {};
+	}
+	request.wheels.$testRunnerOuter = true;
+	request.wheels.$testDataSourceDecision = arguments.decision;
+	application["$$$appTestRunToken"] = CreateUUID();
+	$markTestRunSwap(original = local.saved.dataSourceName);
+	if (arguments.decision.action == "swap") {
+		application.wheels.dataSourceName = arguments.decision.target;
+		application.wheels.coreTestDataSourceName = arguments.decision.target;
+		if (StructKeyExists(application.wheels, "models")) {
+			StructClear(application.wheels.models);
+		}
+		request.wheels.$testRunPreSwap = {original = arguments.decision.primary, target = arguments.decision.target};
+		$warnLiveScopeTestSwap(primary = arguments.decision.primary, target = arguments.decision.target);
+	}
+	return local.saved;
+}
+
+/**
+ * Internal. Restores what `$beginTestRunDataSource()` changed. Called from a
+ * `finally` block, so it does all of its own work (no loops in the caller).
+ */
+public void function $endTestRunDataSource(required struct saved) {
+	if (Compare(application.wheels.dataSourceName, arguments.saved.dataSourceName) != 0) {
+		application.wheels.dataSourceName = arguments.saved.dataSourceName;
+		if (StructKeyExists(application.wheels, "models")) {
+			StructClear(application.wheels.models);
+		}
+	}
+	if (arguments.saved.hasCoreTestDataSourceName) {
+		application.wheels.coreTestDataSourceName = arguments.saved.coreTestDataSourceName;
+	} else {
+		StructDelete(application.wheels, "coreTestDataSourceName");
+	}
+	$clearTestRunSwapMarkers();
+	if (StructKeyExists(request, "wheels")) {
+		StructDelete(request.wheels, "$testRunnerOuter");
+		StructDelete(request.wheels, "$testDataSourceDecision");
+		StructDelete(request.wheels, "$testRunPreSwap");
+	}
+}
+
+/**
+ * Internal. Records, before a test run changes the datasource settings, what they were and
+ * when the run must have ended: the run's request timeout plus a margin, after which a
+ * request that still finds the markers knows the run died before restoring them.
+ */
+public void function $markTestRunSwap(required string original) {
+	application.$$$appTestOriginalDataSource = arguments.original;
+	application.$$$appTestOriginalCoreDataSource = {
+		exists = StructKeyExists(application.wheels, "coreTestDataSourceName"),
+		value = StructKeyExists(application.wheels, "coreTestDataSourceName") ? application.wheels.coreTestDataSourceName : ""
+	};
+	application.$$$appTestRunDeadline = DateAdd("s", Max(1800, $getRequestTimeout()) + 300, Now());
+}
+
+/**
+ * Internal. Moves a running test run's deadline forward (from `from`, normally Now()).
+ * WheelsTest calls this as it builds each spec bundle, so a run that is still building
+ * bundles is never taken for a dead one and restored to the primary datasource mid-run.
+ */
+public void function $extendTestRunDeadline(required date from) {
+	if (StructKeyExists(application, "$$$appTestRunDeadline")) {
+		application.$$$appTestRunDeadline = DateAdd("s", Max(1800, $getRequestTimeout()) + 300, arguments.from);
+	}
+}
+
+/**
+ * Internal. Removes the markers a test run set, once it has restored the settings.
+ */
+public void function $clearTestRunSwapMarkers() {
+	StructDelete(application, "$$$appTestOriginalDataSource");
+	StructDelete(application, "$$$appTestOriginalCoreDataSource");
+	StructDelete(application, "$$$appTestRunDeadline");
+	StructDelete(application, "$$$appTestRunToken");
+}
+
+/**
+ * Internal. Restores the datasource settings a test run changed when that run died
+ * before restoring them (its request was killed, so its finally block never ran).
+ * `force` is for a caller that holds the test-runner lock, which proves no run is in
+ * progress; otherwise the markers count as stranded only after the run's deadline.
+ * Returns true when it restored something.
+ */
+public boolean function $recoverStrandedTestRun(boolean force = false) {
+	if (!StructKeyExists(application, "$$$appTestOriginalDataSource")) {
+		return false;
+	}
+	if (
+		!arguments.force
+		&& (!StructKeyExists(application, "$$$appTestRunDeadline") || DateCompare(Now(), application.$$$appTestRunDeadline) <= 0)
+	) {
+		return false;
+	}
+	local.original = application.$$$appTestOriginalDataSource;
+	if (Compare(application.wheels.dataSourceName, local.original) != 0) {
+		application.wheels.dataSourceName = local.original;
+		if (StructKeyExists(application.wheels, "models")) {
+			StructClear(application.wheels.models);
+		}
+	}
+	if (StructKeyExists(application, "$$$appTestOriginalCoreDataSource")) {
+		if (application.$$$appTestOriginalCoreDataSource.exists) {
+			application.wheels.coreTestDataSourceName = application.$$$appTestOriginalCoreDataSource.value;
+		} else {
+			StructDelete(application.wheels, "coreTestDataSourceName");
+		}
+	}
+	$clearTestRunSwapMarkers();
+	try {
+		WriteLog(
+			file = "wheels",
+			type = "warning",
+			text = "Restored the datasource '" & local.original & "' left switched by a test run that did not finish."
+		);
+	} catch (any e) {
+	}
+	return true;
+}
+
+/**
+ * Internal. Marks a test run that uses the app's primary datasource because
+ * allowTestsAgainstPrimaryDatasource allows it: a response header and a warning in wheels.log.
+ */
+public void function $warnTestsOnPrimaryDataSource(required struct decision) {
+	cfheader(name = "X-Wheels-Test-Database", value = "primary");
+	try {
+		WriteLog(
+			file = "wheels",
+			type = "warning",
+			text = "App tests are running against the PRIMARY datasource '" & arguments.decision.primary & "' because allowTestsAgainstPrimaryDatasource=true and '" & arguments.decision.candidate & "' is not registered. Test writes reach the real database."
+		);
+	} catch (any e) {
+	}
+}
+
+/**
+ * Internal. The warning for a test run that switches the datasource in the LIVE application
+ * scope, or "" when there's nothing to warn about: the run is the isolated `<name>_wheelsTest`
+ * application, or it doesn't switch the datasource. Without the isolated application (the app's
+ * public/Application.cfc lacks the test-context include, or WHEELS_ENV isn't development or
+ * testing), the switch applies to the whole live app until the run ends, so other requests read
+ * and write the test datasource meanwhile.
+ */
+public string function $liveScopeTestSwapWarning(
+	required string applicationName,
+	required string primary,
+	required string target
+) {
+	local.suffix = "_wheelsTest";
+	if (Len(arguments.applicationName) >= Len(local.suffix) && Right(arguments.applicationName, Len(local.suffix)) == local.suffix) {
+		return "";
+	}
+	if (!Len(arguments.target) || Compare(arguments.target, arguments.primary) == 0) {
+		return "";
+	}
+	return "This test run switched the live application's datasource from '" & arguments.primary & "' to '" & arguments.target & "' until it ends, so other requests to this app read and write '" & arguments.target & "' meanwhile. To run tests in their own application instead, include ""../vendor/wheels/events/testcontext.cfm"" in public/Application.cfc after config/app.cfm (as wheels new does) and run with WHEELS_ENV=development or testing.";
+}
+
+/**
+ * Internal. Writes $liveScopeTestSwapWarning() to the wheels log, once: both callers switch the
+ * datasource once per test run (re-entrant requests of the same run don't switch it again).
+ */
+public void function $warnLiveScopeTestSwap(required string primary, required string target) {
+	local.message = $liveScopeTestSwapWarning(
+		applicationName = application.applicationName,
+		primary = arguments.primary,
+		target = arguments.target
+	);
+	if (!Len(local.message)) {
+		return;
+	}
+	try {
+		WriteLog(file = "wheels", type = "warning", text = local.message);
+	} catch (any e) {
+	}
+}
+
+/**
+ * Internal. The JSON body for a refused framework test run (`$coreTestDataSource()` chose
+ * `refuse`). Quoted keys keep their case when serialized.
+ */
+public struct function $coreTestDataSourceRefusal(required struct choice) {
+	return {
+		"success" = false,
+		"error" = "Test database not available",
+		"message" = arguments.choice.message,
+		"datasource" = arguments.choice.decision.primary,
+		"candidate" = arguments.choice.decision.candidate
+	};
+}
+
+/**
+ * Internal. The JSON body for a refused app test run. Quoted keys keep their case when
+ * serialized.
+ */
+public struct function $testDataSourceRefusal(required struct decision) {
+	return {
+		"success" = false,
+		"error" = "Test database not available",
+		"message" = "App tests default to the '" & arguments.decision.candidate & "' datasource, which is not registered. Create it; or run against '"
+			& arguments.decision.primary & "' intentionally with `wheels test --no-test-db` (URL: useTestDB=false); or, for older CLIs that cannot send useTestDB=false, "
+			& "set(allowTestsAgainstPrimaryDatasource=true) in config/settings.cfm. "
+			& "If tests/runner.cfm was copied from an older Wheels release, replace it with the runner `wheels new` creates (it includes wheels/tests/app-runner.cfm).",
+		"datasource" = arguments.decision.primary,
+		"candidate" = arguments.decision.candidate
+	};
+}
+
+/**
+ * Internal. The message an app test run reports when TestBox did not finish. A run
+ * stopped by the request timeout says so, with the limit, so it is not read as a
+ * failure of the specs themselves.
+ */
+public string function $testRunFailureMessage(required any runErr) {
+	local.message = StructKeyExists(arguments.runErr, "message") ? arguments.runErr.message : "";
+	local.type = StructKeyExists(arguments.runErr, "type") ? arguments.runErr.type : "";
+	if (FindNoCase("timeout", local.message & " " & local.type)) {
+		return "The test run hit the request timeout (" & $getRequestTimeout() & " seconds) and was stopped before it finished. " & local.message;
+	}
+	return local.message;
+}
+
+/**
+ * The current wall-clock datetime, or the frozen test clock when a spec has called `travelTo()`.
+ * Framework code reads this instead of a bare `Now()` so a spec can freeze time (cache expiry,
+ * rate-limit windows) deterministically. In production no `travelTo()` runs, so it returns `Now()`
+ * and behaviour is unchanged. The override lives in request scope (`request.$wheelsClock`), set only
+ * by `wheels.WheelsTest.travelTo()`, so it can never leak past the request.
+ *
+ * [section: Miscellaneous Functions]
+ * [category: General Functions]
+ */
+public any function $now() {
+	if (StructKeyExists(request, "$wheelsClock")) {
+		return request.$wheelsClock.at;
+	}
+	return Now();
+}
+
+/**
+ * The millisecond tick counter (`GetTickCount()`), or the frozen test clock's epoch ms when
+ * `travelTo()` is active. Framework time-window logic (RateLimiter) reads this so a spec can freeze it.
+ * Returns `GetTickCount()` verbatim when no travel is active.
+ *
+ * [section: Miscellaneous Functions]
+ * [category: General Functions]
+ */
+public numeric function $tick() {
+	if (StructKeyExists(request, "$wheelsClock")) {
+		return request.$wheelsClock.tick;
+	}
+	return GetTickCount();
+}
 </cfscript>

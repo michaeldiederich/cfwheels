@@ -2,9 +2,9 @@
 
 ## What This Is
 
-This repository contains a **user management and authentication web application** built with the [Wheels](https://wheels.dev/) framework (version 3.0), a modern MVC framework inspired by Ruby on Rails. The app demonstrates best practices for Wheels 3.0, including security, conventions, and a modern UI using Bootstrap.
+This directory contains a **user management and authentication web application** built with the [Wheels](https://wheels.dev/) framework (Wheels 4.x), an MVC framework inspired by Ruby on Rails. The app demonstrates Wheels conventions, security practices, and a Bootstrap UI.
 
-**Important**: This is **not a complete, full-featured app**, but rather a **starter/example app** built with Wheels 3.0. It is designed to help you get started and to showcase best practices in authentication, authorization, auditing, and modern web UI using Wheels.
+**Important**: This is **not a complete, full-featured app**, but rather a **starter/example app** built with Wheels 4.x. It is designed to help you get started and to showcase best practices in authentication, authorization, auditing, and modern web UI using Wheels.
 
 ## Installation
 
@@ -73,14 +73,14 @@ Admin users have access to comprehensive management features:
 
 ### Modern UI
 
-- **Bootstrap 4** for clean, responsive design
+- **Bootstrap 5** for clean, responsive design
 - All forms and navigation use Wheels helpers for consistency and security
 - Mobile-responsive interface
 - Consistent styling across all pages
 
 ## Intended Audience
 
-- **Developers** looking for a reference or starter app for Wheels 3.x
+- **Developers** looking for a reference or starter app for Wheels 4.x
 - **Teams** wanting to learn or demonstrate best practices in Wheels MVC development
 - **Students** learning modern CFML web development
 - **Organizations** evaluating Wheels framework for their projects
@@ -108,7 +108,7 @@ app/
 |── global/             # application-wide globally accessible functions
 ├── views/              # Presentation layer
 ├── mailers/            # Email templates
-plugins/            # Third-party plugins
+plugins/            # Legacy plugins the app still uses (authenticateThis, FlashMessagesBootstrap, jsconfirm)
 ```
 
 ### Key Design Principles
@@ -122,56 +122,87 @@ plugins/            # Third-party plugins
 
 ### Backend
 
-- **3.1.0-snapshot** - MVC Framework
-- **Lucee 5,6,7, Adobe 2018-2025, Boxlang** - CFML Engine
-- **Database** - MySQL, PostgreSQL, Microsoft SQL Server, Oracle, SQLite, H2
+- **Wheels 4.x** - MVC framework, included in `vendor/wheels/`
+- **Lucee 7** - CFML engine under `wheels start` (`lucee.json`); CommandBox's Lucee also works (see below)
+- **Database** - embedded SQLite by default (H2 under CommandBox); MySQL, PostgreSQL, Microsoft SQL Server and Oracle by swapping the datasource
 - **WheelsTest** - Testing framework (vendored with Wheels)
 
 ### Frontend
 
-- **Bootstrap 4** - UI Framework
+- **Bootstrap 5** - UI Framework
 - **jQuery** - JavaScript utilities
 - **Font Awesome** - Icons
 
 ### Development Tools
 
-- **CommandBox** - Package management & server
-- **ForgeBox** - Package repository
+- **Wheels CLI** - Server, migrations, generators and tests (`wheels start`, `wheels migrate`)
+- **CommandBox** - Optional alternative server (see [Using CommandBox instead](#using-commandbox-instead))
 
 ## Quick Start
 
 ### Prerequisites
 
-- **CommandBox** - Latest version
-- **CFML Engine**: Choose one of the following:
-  - Adobe ColdFusion 2018/2021/2023/2025
-  - Lucee 5, Lucee 6, Lucee 7
-  - Boxlang
+- The **Wheels CLI** (`wheels`), 4.2 or later. See the
+  [installation guide](https://guides.wheels.dev/) for Homebrew, Scoop, apt and yum.
 
-### Install and Run (zero-config)
+The release zip includes the framework in `vendor/wheels/` and uses an embedded
+**SQLite** database, so there's nothing else to install and no database server to run.
 
-The starter app boots out of the box with no database server and no `.env` file.
-It ships with an **H2 embedded database** (the H2 Lucee extension is declared in
-`server.json`, so CommandBox installs it automatically on first start) and the
-`authenticateThis` plugin is bundled under `plugins/`.
+### Install and Run
 
 ```bash
-# 1. Install the framework (lands in vendor/wheels/)
-box install
+# 1. Unzip the release and change into it
+unzip wheels-starter-app-<version>.zip -d my-starter-app
+cd my-starter-app
 
-# 2. Start the server (auto-installs the H2 extension, boots the app)
-box server start
+# 2. Create .env, then set WHEELS_RELOAD_PASSWORD and
+#    WHEELS_LUCEE_ADMIN_PASSWORD in it to values of your own
+cp .env.example .env
 
-# 3. Create the schema and seed the default data
+# 3. Start the server (http://localhost:8080)
+wheels start
+
+# 4. Create the schema and seed the default data
 wheels migrate latest
 
-# 4. Reload the application so the seeded settings load
-#    (or just restart the server). Then open the site:
-box server open
+# 5. Reload so the app picks up the seeded settings
+wheels reload
 ```
+
+Until step 4 has run, the site returns an error such as `key [general_sitename] doesn't exist`:
+the app reads its `settings` table when it starts. `wheels migrate latest` and `wheels reload`
+need the reload password from step 2.
+
+The database files are `db/development.sqlite` and, for the tests, `db/test.sqlite`.
 
 Default sign-in credentials are seeded by the migrations — see
 `app/migrator/migrations/20180519105944_Adds_Default_UserAccounts.cfc`.
+
+### Using CommandBox instead
+
+The app also runs on [CommandBox](https://www.ortussolutions.com/products/commandbox).
+CommandBox's Lucee has no SQLite driver, so under CommandBox the app uses an **H2**
+embedded database instead: `server.json` installs the H2 Lucee extension and sets
+`WHEELS_STARTER_DB=h2`, which `config/app.cfm` checks. The data files go in `db/h2/`.
+
+```bash
+# 1. Create .env and set WHEELS_RELOAD_PASSWORD in it, as in step 2 above
+#    (WHEELS_LUCEE_ADMIN_PASSWORD is only read by `wheels start`)
+cp .env.example .env
+
+# 2. Start the server (http://localhost:8081)
+box server start
+
+# 3. Create the schema and seed the default data: open the migrator page
+#    http://localhost:8081/wheels/migrator
+#    and click "Migrate To Latest", then "Confirm & Execute".
+
+# 4. Restart the server so the app loads the seeded settings
+box server restart
+```
+
+The `wheels` CLI commands, such as `wheels migrate latest`, talk to a server started with
+`wheels start`, so use the migrator page here.
 
 ### Using a server-based database instead
 
@@ -179,7 +210,7 @@ To point the app at MySQL, PostgreSQL, SQL Server, or Oracle:
 
 1. Copy `.env.example` to `.env`
 2. Configure database settings based on your chosen database (see below)
-3. Replace the H2 datasource block in `config/app.cfm` with one that reads the
+3. Replace the datasource definitions in `config/app.cfm` with one that reads the
    `this.env.DB_*` values (the original env-driven MySQL example is preserved in
    the comments of `.env.example`)
 
@@ -306,28 +337,31 @@ DB_PASSWORD=
 
 ```
 tests/
-├── Test.cfc              # Base test
-├── functions/            # Test utilities
-├── requests/             # HTTP tests
-└── models/               # Model tests
+├── runner.cfm      # Entry point for /wheels/app/tests (the app template's runner)
+├── populate.cfm    # Migrates the test database before each run
+├── specs/          # WheelsTest (BDD) specs: what the runner runs
+└── RocketUnit/     # Legacy RocketUnit tests from the 3.x app (not run)
 ```
 
 ### Running Tests
 
-```bash
-# Run all tests
-wheels test run
+With the server running, open:
 
-# Run specific test suite
-wheels test run --directory tests/requests/
 ```
+http://localhost:8080/wheels/app/tests
+```
+
+(port 8081 under CommandBox). Add `?format=json` for a JSON result. The specs run on
+the `starterApp_test` datasource (SQLite, or H2 under CommandBox; defined in
+`config/app.cfm`), which `tests/populate.cfm`
+migrates before every run, so they never touch the development database.
 
 ## Support & Resources
 
 ### Documentation
 
-- [Wheels Guides](https://wheels.dev/guides)
-- [Wheels Api Reference](https://wheels.dev/api/v3.1.0)
+- [Wheels Guides](https://guides.wheels.dev/)
+- [Wheels API Reference](https://api.wheels.dev/)
 
 ### Community
 

@@ -58,6 +58,23 @@ component output="false" extends="wheels.Global"{
 	}
 
 	/**
+	 * Makes what middleware attached to the request context available to the controller:
+	 * the whole context as `request.wheels.middlewareContext`, and the AuthMiddleware result
+	 * as `request.auth` (as AuthMiddleware documents). Its parameter is deliberately not named
+	 * `request`, which would shadow the request scope (and resolves inconsistently on Adobe
+	 * 2025, cross-engine invariant 15).
+	 */
+	public void function $exposeMiddlewareContext(required struct context) {
+		if (!StructKeyExists(request, "wheels")) {
+			request.wheels = {};
+		}
+		request.wheels.middlewareContext = arguments.context;
+		if (StructKeyExists(arguments.context, "auth")) {
+			request.auth = arguments.context.auth;
+		}
+	}
+
+	/**
 	 * Retrieve plugin-registered middleware from the application scope.
 	 * Returns the pluginMiddleware array or an empty array if not present.
 	 */
@@ -103,7 +120,19 @@ component output="false" extends="wheels.Global"{
 				application[local.appKey].$middlewareInstanceCache = {};
 			}
 			if (!StructKeyExists(application[local.appKey].$middlewareInstanceCache, arguments.middleware)) {
-				application[local.appKey].$middlewareInstanceCache[arguments.middleware] = CreateObject("component", arguments.middleware).init();
+				// MiddlewareInterface requires only handle(), so init() is optional:
+				// call it when the component has one (its own or inherited). As
+				// before, an object init() returns is what gets cached; anything
+				// else (nothing from a void init(), or a boolean, string or struct)
+				// leaves the component itself as the cached middleware.
+				local.instance = CreateObject("component", arguments.middleware);
+				if (StructKeyExists(local.instance, "init")) {
+					local.initResult = local.instance.init();
+					if (!IsNull(local.initResult) && IsObject(local.initResult)) {
+						local.instance = local.initResult;
+					}
+				}
+				application[local.appKey].$middlewareInstanceCache[arguments.middleware] = local.instance;
 			}
 		}
 		return application[local.appKey].$middlewareInstanceCache[arguments.middleware];
@@ -215,10 +244,20 @@ component output="false" extends="wheels.Global"{
 			}
 		}
 
-		// --- Fallback: Full linear scan ---
-		// Scan all routes in registration order, filtering by HTTP method.
+		// --- Indexed scan (#4157) ---
+		// Only the routes that can match: those allowing this method whose first
+		// path segment equals the request's, merged with the routes whose first
+		// segment is a variable, in declaration order. Same decisions as a scan of
+		// every route; on RustCFML that full scan also outgrows the engine's
+		// 256-pattern regex cache once a table has a few hundred routes.
 		if (!StructKeyExists(local, "rv")) {
-			for (local.route in arguments.routes) {
+			local.candidates = $dynamicRouteCandidates(
+				routes = arguments.routes,
+				method = arguments.requestMethod,
+				path = arguments.path
+			);
+			for (local.position in local.candidates) {
+				local.route = arguments.routes[local.position];
 				// If method doesn't match, skip this route.
 				if (StructKeyExists(local.route, "methods") && !ListFindNoCase(local.route.methods, arguments.requestMethod)) {
 					continue;
@@ -253,9 +292,18 @@ component output="false" extends="wheels.Global"{
 
 			// Try and provide some more information for why the route hasn't matched:
 			// For example, the developer is accidentally GETing to a route which only allows POST.
-			for (local.route in arguments.routes) {
+			// Only routes indexed under this path's first segment (any method) can match it.
+			local.candidates = $dynamicRouteCandidates(
+				routes = arguments.routes,
+				method = "",
+				path = arguments.path
+			);
+			for (local.position in local.candidates) {
+				local.route = arguments.routes[local.position];
+				if (!StructKeyExists(local.route, "regex")) {
+					local.route.regex = arguments.mapper.$patternToRegex(local.route.pattern);
+				}
 				// If route matches regular expression, append to alternatives to display.
-				// (regex was already compiled during the main matching loop above)
 				if (ReFindNoCase(local.route.regex, arguments.path) || (!Len(arguments.path) && local.route.pattern == "/")) {
 					local.alternativeMatchingMethodsForURL = ListAppend(local.alternativeMatchingMethodsForURL, local.route.methods);
 				}
@@ -277,6 +325,224 @@ component output="false" extends="wheels.Global"{
 			}
 		}
 
+		return local.rv;
+	}
+
+	/**
+	 * Internal function. Positions (ascending, so declaration order holds) of the
+	 * routes that can match `path` for `method` (#4157). A route is filed under its
+	 * first two path segments when they are plain literals: `seg1/seg2`, or
+	 * `seg1/*` when only the first is (a variable or no second segment), or `*`
+	 * when the first isn't either (a variable, the root, a literal glued to a
+	 * variable). A path's candidates are its `seg1/seg2` bucket merged with
+	 * `seg1/*` and `*`, which is every route that can match it. Routes without
+	 * `methods` allow every method, as in a full scan. An empty `method` means
+	 * any method (the 404 diagnosis).
+	 */
+	public array function $dynamicRouteCandidates(required array routes, required string method, required string path) {
+		local.index = $dynamicRouteIndex(arguments.routes);
+		local.methodKey = Len(arguments.method) ? UCase(arguments.method) : "*ANY*";
+		if (!StructKeyExists(local.index.methods, local.methodKey)) {
+			// A verb no route names: only routes without `methods` can match.
+			local.methodKey = "*UNLISTED*";
+		}
+		local.segments = ListToArray(arguments.path, "/");
+		local.first = ArrayLen(local.segments) ? $routeSegmentKey(local.segments[1]) : "";
+		local.second = ArrayLen(local.segments) > 1 ? $routeSegmentKey(local.segments[2]) : "";
+		for (local.bucketKey in [
+			local.methodKey & "|" & local.first & "/" & local.second,
+			local.methodKey & "|" & local.first & "/~",
+			local.methodKey & "|*"
+		]) {
+			if (StructKeyExists(local.index.buckets, local.bucketKey)) {
+				return local.index.buckets[local.bucketKey];
+			}
+		}
+		return [];
+	}
+
+	/**
+	 * Internal function. The route index for `routes`, cached on the application
+	 * and reused only while it still describes the live table:
+	 * - `routeTableGeneration` is unchanged (`$addRoute()` and route reloads bump it);
+	 * - the route count is unchanged;
+	 * - a sampled signature of the table is unchanged (`$routeTableSignature()`).
+	 *   This catches a table assigned to `application.wheels.routes` directly,
+	 *   which bumps nothing. Specs restore saved tables that way, and app code may.
+	 */
+	public struct function $dynamicRouteIndex(required array routes) {
+		local.generation = StructKeyExists(application.wheels, "routeTableGeneration") ? application.wheels.routeTableGeneration : 0;
+		local.count = ArrayLen(arguments.routes);
+		local.signature = $routeTableSignature(arguments.routes);
+		if (
+			StructKeyExists(application.wheels, "dynamicRouteIndex")
+			&& application.wheels.dynamicRouteIndex.generation == local.generation
+			&& application.wheels.dynamicRouteIndex.count == local.count
+			&& application.wheels.dynamicRouteIndex.signature == local.signature
+		) {
+			return application.wheels.dynamicRouteIndex;
+		}
+		local.index = $buildDynamicRouteIndex(routes = arguments.routes);
+		local.index.generation = local.generation;
+		local.index.count = local.count;
+		local.index.signature = local.signature;
+		application.wheels.dynamicRouteIndex = local.index;
+		return local.index;
+	}
+
+	/**
+	 * Internal function. A fixed-cost fingerprint of a route table: the name, pattern
+	 * and methods of its first and last routes and of up to 16 evenly spaced routes
+	 * between them. Two different tables of the same length differ here unless they
+	 * agree on every sampled route.
+	 */
+	public string function $routeTableSignature(required array routes) {
+		local.count = ArrayLen(arguments.routes);
+		if (!local.count) {
+			return "";
+		}
+		local.step = Max(1, Int(local.count / 16));
+		local.positions = [1];
+		for (local.i = 1 + local.step; local.i < local.count; local.i += local.step) {
+			ArrayAppend(local.positions, local.i);
+		}
+		ArrayAppend(local.positions, local.count);
+		local.parts = [];
+		for (local.i in local.positions) {
+			local.route = arguments.routes[local.i];
+			ArrayAppend(
+				local.parts,
+				(StructKeyExists(local.route, "name") ? local.route.name : "")
+				& "|" & local.route.pattern
+				& "|" & (StructKeyExists(local.route, "methods") ? local.route.methods : "")
+			);
+		}
+		return ArrayToList(local.parts, Chr(10));
+	}
+
+	/**
+	 * Internal function. Builds `{methods, buckets}`. For each method (and `*ANY*`,
+	 * ignoring the method; `*UNLISTED*`, only routes without `methods`):
+	 * `METHOD|a/b` = routes filed under `a/b`, `a/*` and `*`; `METHOD|a/~` = routes
+	 * filed under `a/*` and `*`; `METHOD|*` = routes filed under `*`. Each list is
+	 * ascending.
+	 */
+	public struct function $buildDynamicRouteIndex(required array routes) {
+		local.filed = {};
+		local.firstKeys = {};
+		local.methods = {};
+		local.iEnd = ArrayLen(arguments.routes);
+		// Every verb any route names, so a route without `methods` can be filed under each.
+		for (local.i = 1; local.i <= local.iEnd; local.i++) {
+			if (StructKeyExists(arguments.routes[local.i], "methods")) {
+				for (local.m in ListToArray(arguments.routes[local.i].methods)) {
+					local.methods[UCase(Trim(local.m))] = true;
+				}
+			}
+		}
+		for (local.i = 1; local.i <= local.iEnd; local.i++) {
+			local.route = arguments.routes[local.i];
+			local.key = $routePatternIndexKey(local.route.pattern);
+			if (local.key != "*") {
+				local.firstKeys[ListFirst(local.key, "/")] = true;
+			}
+			if (StructKeyExists(local.route, "methods")) {
+				local.routeMethods = ListToArray(UCase(local.route.methods));
+			} else {
+				local.routeMethods = StructKeyArray(local.methods);
+				ArrayAppend(local.routeMethods, "*UNLISTED*");
+			}
+			ArrayAppend(local.routeMethods, "*ANY*");
+			for (local.m in local.routeMethods) {
+				local.filedKey = Trim(local.m) & "|" & local.key;
+				if (!StructKeyExists(local.filed, local.filedKey)) {
+					local.filed[local.filedKey] = [];
+				}
+				ArrayAppend(local.filed[local.filedKey], local.i);
+			}
+		}
+		local.methodKeys = StructKeyArray(local.methods);
+		ArrayAppend(local.methodKeys, "*ANY*");
+		ArrayAppend(local.methodKeys, "*UNLISTED*");
+		local.buckets = {};
+		for (local.methodKey in local.methodKeys) {
+			local.unkeyed = StructKeyExists(local.filed, local.methodKey & "|*") ? local.filed[local.methodKey & "|*"] : [];
+			local.buckets[local.methodKey & "|*"] = local.unkeyed;
+			for (local.first in local.firstKeys) {
+				local.firstOnly = StructKeyExists(local.filed, local.methodKey & "|" & local.first & "/*")
+					? local.filed[local.methodKey & "|" & local.first & "/*"]
+					: [];
+				local.buckets[local.methodKey & "|" & local.first & "/~"] = $mergeAscending(local.firstOnly, local.unkeyed);
+			}
+		}
+		for (local.filedKey in local.filed) {
+			local.key = ListRest(local.filedKey, "|");
+			if (local.key == "*" || ListLast(local.key, "/") == "*") {
+				continue;
+			}
+			local.methodKey = ListFirst(local.filedKey, "|");
+			local.buckets[local.filedKey] = $mergeAscending(
+				local.filed[local.filedKey],
+				local.buckets[local.methodKey & "|" & ListFirst(local.key, "/") & "/~"]
+			);
+		}
+		local.methods["*ANY*"] = true;
+		local.methods["*UNLISTED*"] = true;
+		return {methods = local.methods, buckets = local.buckets};
+	}
+
+	/**
+	 * Internal function. Where a route is filed: `a/b` when its first two segments
+	 * are plain literals, `a/*` when only the first is, `*` otherwise. A segment is
+	 * keyed by `$routeSegmentKey()`; one that isn't plain literal characters
+	 * (optionally followed by `.`, as with a `.[format]` suffix) can't be.
+	 */
+	public string function $routePatternIndexKey(required string pattern) {
+		local.segments = ListToArray(arguments.pattern, "/");
+		if (!ArrayLen(local.segments) || !$isLiteralRouteSegment(local.segments[1])) {
+			return "*";
+		}
+		local.first = $routeSegmentKey(local.segments[1]);
+		if (ArrayLen(local.segments) > 1 && $isLiteralRouteSegment(local.segments[2])) {
+			return local.first & "/" & $routeSegmentKey(local.segments[2]);
+		}
+		return local.first & "/*";
+	}
+
+	/**
+	 * Internal function. True when a pattern segment is plain literal characters,
+	 * optionally followed by `.` and anything (a `.[format]` or `.xml` suffix).
+	 */
+	public boolean function $isLiteralRouteSegment(required string segment) {
+		return ReFind("^[A-Za-z0-9_\-]+(\..*)?$", arguments.segment) > 0;
+	}
+
+	/**
+	 * Internal function. A segment's key: cut at the first `.`, lower-cased (route
+	 * matching is case-insensitive).
+	 */
+	public string function $routeSegmentKey(required string segment) {
+		return LCase(ListFirst(arguments.segment, "."));
+	}
+
+	/**
+	 * Internal function. Merges two ascending arrays of positions into one.
+	 */
+	public array function $mergeAscending(required array first, required array second) {
+		local.rv = [];
+		local.i = 1;
+		local.j = 1;
+		local.firstLen = ArrayLen(arguments.first);
+		local.secondLen = ArrayLen(arguments.second);
+		while (local.i <= local.firstLen || local.j <= local.secondLen) {
+			if (local.j > local.secondLen || (local.i <= local.firstLen && arguments.first[local.i] < arguments.second[local.j])) {
+				ArrayAppend(local.rv, arguments.first[local.i]);
+				local.i++;
+			} else {
+				ArrayAppend(local.rv, arguments.second[local.j]);
+				local.j++;
+			}
+		}
 		return local.rv;
 	}
 
@@ -326,6 +592,17 @@ component output="false" extends="wheels.Global"{
 	}
 
 	/**
+	 * Internal function. Answers a `/wheels/jobs/tick` request through JobTickEndpoint: sets the
+	 * status and content type, and returns the body.
+	 */
+	public string function $respondToJobsTick(required any endpoint, required struct urlScope) {
+		local.response = arguments.endpoint.respond(urlScope = arguments.urlScope);
+		cfheader(statuscode = local.response.status);
+		cfcontent(type = local.response.contentType);
+		return local.response.body;
+	}
+
+	/**
 	 * Parse incoming params, create controller object, call an action on it and return the response.
 	 * Called from index.cfm in the root so what we return here is the final result of the request processing.
 	 * This currently needs to be public as it's called from elsewhere
@@ -340,6 +617,16 @@ component output="false" extends="wheels.Global"{
 		// This is used for maintenance mode content.
 		if (StructKeyExists(request, "$wheelsAbortContent")) {
 			return request.$wheelsAbortContent;
+		}
+
+		// The jobs tick route (`/wheels/jobs/tick`, #4482): token-gated, answered before routing and
+		// before the public-component gate, so it works with enablePublicComponent = false and
+		// doesn't depend on the app's routes or middleware. 404 unless jobsRunnerToken is set.
+		if (StructKeyExists(application, "wheels") && StructKeyExists(application.wheels, "jobsRunnerToken") && Len(application.wheels.jobsRunnerToken)) {
+			local.tickEndpoint = new wheels.JobTickEndpoint();
+			if (local.tickEndpoint.isTickPath(arguments.pathInfo)) {
+				return $respondToJobsTick(local.tickEndpoint, arguments.urlScope);
+			}
 		}
 
 		if ($get("showDebugInformation")) {
@@ -417,12 +704,13 @@ component output="false" extends="wheels.Global"{
 				}
 
 				// Dev-tools network-origin gate: the password-less /wheels GUI
-				// endpoints only answer requests addressed to a local host name
-				// (Host header + no non-loopback X-Forwarded-For; not the socket, so
-				// Docker port-mapped access keeps working). Mutating endpoints add
-				// their own loopback-socket + CSRF / password checks on top. Guarded
-				// so a test double swapped in for the public component (which need not
-				// implement the gate) still dispatches.
+				// endpoints only answer a loopback socket peer (or one listed in
+				// devToolsAllowedRemoteAddresses, development/testing only) that
+				// addresses a local host name with no non-loopback X-Forwarded-For
+				// hop, and never in production. See Public.$devToolAccessCheck().
+				// Mutating endpoints add their own CSRF / password checks on top.
+				// Guarded so a test double swapped in for the public component
+				// (which need not implement the gate) still dispatches.
 				if (StructKeyExists(application.wheels.public, "$enforceDevToolLocalAccess")) {
 					application.wheels.public.$enforceDevToolLocalAccess();
 				}
@@ -445,8 +733,32 @@ component output="false" extends="wheels.Global"{
 				cgi = $buildMiddlewareCgiScope()
 			};
 
+			// F23: in the isolated test context (development/testing only), honour a test-supplied
+			// client address so RateLimiter / IP rules can be exercised per client. The override
+			// reaches middleware through the request context's `remoteAddr` field — the field
+			// RateLimiter already reads — and never mutates the cgi scope. The header-present guard
+			// keeps every normal request off this path; the TestContext gate (isolated AND
+			// development/testing) means it is impossible to honour outside the isolated test app.
+			if (StructKeyExists(local.requestContext.cgi, "http_x_wheels_test_remote_addr")) {
+				local.testContext = new wheels.events.TestContext();
+				// Pass the REAL socket peer (raw cgi.remote_addr, never a forwarded header): the override
+				// is honoured only from a loopback peer, so it cannot be set by an outside client.
+				local.rawPeer = (StructKeyExists(cgi, "remote_addr") ? ToString(cgi.remote_addr) : "");
+				local.testRemoteAddr = local.testContext.$testClientRemoteAddr(
+					cgiScope = local.requestContext.cgi,
+					isolated = local.testContext.currentRequestIsIsolated(),
+					remoteAddr = local.rawPeer
+				);
+				if (Len(local.testRemoteAddr)) {
+					local.requestContext.remoteAddr = local.testRemoteAddr;
+				}
+			}
+
 			// The core handler that middleware wraps around.
 			local.coreHandler = function(required struct request) {
+				// What middleware attached to the context (the AuthMiddleware result, ...)
+				// must reach the controller, not just the params.
+				$exposeMiddlewareContext(context = arguments.request);
 				local.ctrl = controller(name = arguments.request.params.controller, params = arguments.request.params);
 				local.ctrl.processAction();
 
@@ -753,7 +1065,7 @@ component output="false" extends="wheels.Global"{
 			} else {
 				return local.rv;
 			}
-			local.modelName = capitalize(singularize(local.controllerName));
+			local.modelName = $routeBindingModelName(local.controllerName);
 		}
 
 		// Negative cache: a conventional binding that previously failed to resolve is skipped
@@ -880,7 +1192,12 @@ component output="false" extends="wheels.Global"{
 			application.$wheelsRouteBindingWarnings[local.dedupKey] = true;
 
 			// Derive the singular name binding would use (matches $resolveRouteModelBinding logic).
-			local.modelName = capitalize(singularize(local.controller));
+			// No hint when there is no such model: binding could not load anything, so the
+			// hint would only name a model that does not exist (#3940).
+			local.modelName = $routeBindingModelName(local.controller);
+			if (!$routeBindingModelExists(local.modelName)) {
+				return false;
+			}
 			local.singular = LCase(Left(local.modelName, 1)) & Mid(local.modelName, 2, Len(local.modelName) - 1);
 			local.routeName = StructKeyExists(arguments.route, "name") ? arguments.route.name : "";
 
@@ -897,6 +1214,30 @@ component output="false" extends="wheels.Global"{
 			return true;
 		} catch (any ignored) {
 			// Warning emission is best-effort; never block dispatch.
+			return false;
+		}
+	}
+
+	/**
+	 * Internal function. The model name route model binding derives from a controller
+	 * name: the last segment of a namespaced controller, singularized and capitalized,
+	 * so `admin.users` binds the `User` model, not `Admin.user` (#3940). A model in a
+	 * subfolder needs an explicit `binding="admin/User"` on the resource.
+	 */
+	public string function $routeBindingModelName(required string controllerName) {
+		return capitalize(singularize(ListLast(arguments.controllerName, "./")));
+	}
+
+	/**
+	 * Internal function. True when `model(name)` resolves. Only the binding hint calls
+	 * this, at most once per controller and action, so a missing model costs one failed
+	 * lookup per reload.
+	 */
+	public boolean function $routeBindingModelExists(required string modelName) {
+		try {
+			model(arguments.modelName);
+			return true;
+		} catch (any e) {
 			return false;
 		}
 	}

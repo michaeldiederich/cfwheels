@@ -28,6 +28,35 @@
     // Define helper functions as variables-scoped closures to avoid Adobe CF's
     // DuplicateFunctionDefinitionException (this file can be included from multiple
     // CFC methods via different include paths)
+    // Hard-refuse the core test runner in production,
+    // independent of enablePublicComponent. The onApplicationStart backstop
+    // already refuses an isolated start outside dev/testing; this is the
+    // belt-and-suspenders at the runner itself. Minimal 403, no detail.
+    if (
+        StructKeyExists(application, "wheels")
+        && StructKeyExists(application.wheels, "environment")
+        && application.wheels.environment == "production"
+    ) {
+        cfheader(statuscode = 403);
+        cfheader(name = "Content-Type", value = "text/plain; charset=utf-8");
+        writeOutput("Forbidden");
+        abort;
+    }
+
+    // Warn when test-context isolation is OFF (the request bound the
+    // live application scope instead of <name>_wheelsTest). Set WHEELS_ENV=
+    // development or testing so events/testcontext.cfm binds the isolated app.
+    if (!(Len(application.applicationName) >= 11 && Right(application.applicationName, 11) == "_wheelsTest")) {
+        cfheader(name = "X-Wheels-Test-Isolation", value = "off");
+        try {
+            writeLog(
+                file = "wheels",
+                type = "warning",
+                text = "Test runner isolation is OFF: application '" & application.applicationName & "' is not the isolated _wheelsTest scope. Set WHEELS_ENV=development or testing."
+            );
+        } catch (any e) {}
+    }
+
     variables.$_duplicateWheelsEnv = function(required struct original) {
         var backup = {}
         for (var key in arguments.original) {
@@ -116,17 +145,10 @@
             application.wheels.csrfCookieEncryptionAlgorithm,
             application.wheels.csrfCookieEncryptionEncoding
         )
-        if (structKeyExists(url, "db") && listFind("mysql,sqlserver,sqlserver_cicd,postgres,h2,oracle,sqlite,cockroachdb", url.db)) {
-            if (listFind("sqlserver,sqlserver_cicd", url.db)) {
-                application.wheels.dataSourceName = "wheelstestdb_sqlserver";
-            } else {
-                application.wheels.dataSourceName = "wheelstestdb_" & url.db;
-            }
-        } else if (application.wheels.coreTestDataSourceName eq "|datasourceName|") {
-            application.wheels.dataSourceName = "wheelstestdb";
-        } else {
-            application.wheels.dataSourceName = application.wheels.coreTestDataSourceName;
-        }
+        // Chosen before this swap by $coreTestDataSource(): `?db=` / the |datasourceName|
+        // placeholder / a dedicated coreTestDataSourceName as before, and never the
+        // app's primary datasource unless the request asks for it (useTestDB=false).
+        application.wheels.dataSourceName = variables.$_coreTestDataSourceName;
 
         // Clear model cache when switching datasources so models are
         // re-initialized with the correct adapter for the target database.
@@ -246,6 +268,22 @@
                     application.wheels = application.$$$wheels;
                     structDelete(application, "$$$wheels");
                 }
+                // Pick the datasource before swapping in the test config, so a refusal
+                // leaves nothing to restore. In an app, a coreTestDataSourceName that is the
+                // app's own datasource would run the framework's specs (and populate.cfm)
+                // there; that run uses `<datasource>_test` or is refused.
+                local.coreDataSource = application.wo.$coreTestDataSource(
+                    primary = application.wheels.dataSourceName,
+                    coreName = StructKeyExists(application.wheels, "coreTestDataSourceName") ? application.wheels.coreTestDataSourceName : application.wheels.dataSourceName,
+                    requestUrl = url
+                );
+                if (local.coreDataSource.action == "refuse") {
+                    cfheader(statuscode = 409);
+                    cfcontent(type = "application/json");
+                    WriteOutput(SerializeJSON(application.wo.$coreTestDataSourceRefusal(choice = local.coreDataSource)));
+                    abort;
+                }
+                variables.$_coreTestDataSourceName = local.coreDataSource.target;
                 application["$$$wheelsTestRunToken"] = CreateUUID();
                 variables.$_setTestboxEnv();
             }

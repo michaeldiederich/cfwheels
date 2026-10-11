@@ -282,6 +282,43 @@ component extends="wheels.wheelstest.system.BaseSpec" {
 				$tearDown(sandbox);
 			});
 
+			it("reads the env() default of the generated settings.cfm line (##3946)", () => {
+				var sandbox = $scaffold(settingsBody = 'set(dataSourceName=env("WHEELS_DATASOURCE", "myapp"));');
+				var localMod = new cli.lucli.Module(cwd = sandbox);
+				expect(localMod.$resolveAppTestDataSource(true)).toBe("myapp_test");
+				$tearDown(sandbox);
+			});
+
+			it("uses the .env value of the variable the settings.cfm env() call names (##3946)", () => {
+				var sandbox = $scaffold(
+					settingsBody = 'set(dataSourceName=env("WHEELS_DATASOURCE", "myapp"));',
+					envBody      = "WHEELS_ENV=development" & chr(10) & "WHEELS_DATASOURCE=from_dotenv"
+				);
+				var localMod = new cli.lucli.Module(cwd = sandbox);
+				expect(localMod.$resolveAppTestDataSource(false)).toBe("from_dotenv");
+				$tearDown(sandbox);
+			});
+
+			it("reads a quoted .env value, and the last line for the key, as the app does (##3946)", () => {
+				var sandbox = $scaffold(
+					settingsBody = 'set(dataSourceName=env("WHEELS_DATASOURCE", "myapp"));',
+					envBody      = "## WHEELS_DATASOURCE=commented" & chr(10) & "WHEELS_DATASOURCE=first" & chr(10) & 'WHEELS_DATASOURCE="quoted"'
+				);
+				var localMod = new cli.lucli.Module(cwd = sandbox);
+				expect(localMod.$resolveAppTestDataSource(false)).toBe("quoted");
+				$tearDown(sandbox);
+			});
+
+			it("ignores a .env WHEELS_DATASOURCE when settings.cfm hardcodes the name", () => {
+				var sandbox = $scaffold(
+					settingsBody = 'set(dataSourceName="literal");',
+					envBody      = "WHEELS_DATASOURCE=unused"
+				);
+				var localMod = new cli.lucli.Module(cwd = sandbox);
+				expect(localMod.$resolveAppTestDataSource(false)).toBe("literal");
+				$tearDown(sandbox);
+			});
+
 			it("prefers .env DATASOURCE_NAME over config/settings.cfm", () => {
 				var sandbox = $scaffold(
 					settingsBody = 'set(dataSourceName="from_settings");',
@@ -366,6 +403,19 @@ component extends="wheels.wheelstest.system.BaseSpec" {
 				// their own runner/reload semantics.
 				expect(moduleSource).toInclude("if (!coreTests) {");
 				expect(moduleSource).toInclude("$reloadTestApplication(serverPort, testPath);");
+			});
+
+			// The app runner now defaults an OMITTED useTestDB to true,
+			// so `wheels test --no-test-db` must send useTestDB=false explicitly or
+			// it would be reinterpreted as the test database.
+			it("appends useTestDB explicitly for every app run (never omits it on --no-test-db)", () => {
+				var moduleSource = fileRead(expandPath("/cli/lucli/Module.cfc"));
+				expect(moduleSource).toInclude('testUrl &= "&useTestDB=" & (useTestDB ? "true" : "false");');
+				// the old conditional-append (only when true) omitted useTestDB=false
+				expect(Find('if (!coreTests && useTestDB) {', moduleSource)).toBe(
+					0,
+					"the only-when-true append must be gone (it omits useTestDB=false on --no-test-db)"
+				);
 			});
 
 			it("returns true and treats the reload redirect (302) as a successful restart", () => {

@@ -7,7 +7,13 @@ component extends="wheels.Global" implements="wheels.interfaces.events.EventHand
 			}
 			// Fire registered onError callbacks (packages like Sentry hook in here).
 			$fireOnErrorCallbacks(arguments.exception);
-			if ($get("showErrorInformation")) {
+			// Development only, and only while showErrorInformation is on: an error
+			// asked for as JSON or Markdown gets the structured error-page payload
+			// (agent-readable). Testing and production are unchanged.
+			local.agentFormat = $agentErrorFormat();
+			if (Len(local.agentFormat)) {
+				local.rv = $runOnErrorRenderAgentError(arguments.exception, local.agentFormat);
+			} else if ($get("showErrorInformation")) {
 				// Detect request format for format-specific error handling
 				local.format = $getRequestFormat();
 				local.wheelsError = $runOnErrorResolveWheelsError(arguments.exception);
@@ -112,7 +118,17 @@ component extends="wheels.Global" implements="wheels.interfaces.events.EventHand
 				local.wheelsError = arguments.exception.cause.rootCause;
 			}
 		} else {
-			if (StructKeyExists(arguments.exception, "rootCause") && Left(arguments.exception.rootCause.type, 6) == "Wheels") {
+			// IsDefined (not IsStruct): the production error path can hand us a
+			// rootCause that is a real caught exception / Java Throwable, not a plain
+			// struct, so IsStruct would wrongly drop a genuine Wheels error to 500.
+			// IsDefined string-resolves the whole dotted path in one evaluation —
+			// true for a struct OR an object that exposes `.type`, false when
+			// rootCause is absent, null, or has no type (so a typeless rootCause
+			// falls through to {} instead of crashing the error page).
+			if (
+				IsDefined("arguments.exception.rootCause.type")
+				&& Left(arguments.exception.rootCause.type, 6) == "Wheels"
+			) {
 				local.wheelsError = arguments.exception.rootCause;
 			} else if (
 				StructKeyExists(arguments.exception, "cause")
@@ -239,6 +255,95 @@ component extends="wheels.Global" implements="wheels.interfaces.events.EventHand
 		return local.rv;
 	}
 
+	/**
+	 * "json", "md" or "" (not an agent-readable error response). Only in the
+	 * development environment with showErrorInformation on; with it off the
+	 * response is today's. An explicit ?format= decides first (json or md; any
+	 * other value keeps today's handling); otherwise JSON when the request asks for
+	 * it, and Markdown when the Accept header lists text/markdown without
+	 * application/json. "md" is a format for error responses only, never added to
+	 * the formats setting, so controller content negotiation is unaffected.
+	 */
+	public string function $agentErrorFormat() {
+		if ($get("environment") != "development" || !$get("showErrorInformation")) {
+			return "";
+		}
+		local.param = $errorFormatParam();
+		if (Len(local.param)) {
+			return ListFindNoCase("json,md", local.param) ? LCase(local.param) : "";
+		}
+		local.accept = $errorAcceptHeader();
+		if (FindNoCase("application/json", local.accept) || $getRequestFormat() == "json") {
+			return "json";
+		}
+		if (FindNoCase("text/markdown", local.accept)) {
+			return "md";
+		}
+		return "";
+	}
+
+	/**
+	 * The request's ?format= value when it is alphanumeric (the same guard as
+	 * $getRequestFormat), else "".
+	 */
+	public string function $errorFormatParam() {
+		if (StructKeyExists(url, "format") && IsSimpleValue(url.format) && ReFind("^[A-Za-z0-9]+$", url.format)) {
+			return url.format;
+		}
+		return "";
+	}
+
+	public string function $errorAcceptHeader() {
+		return IsDefined("request.cgi.http_accept") ? request.cgi.http_accept : "";
+	}
+
+	public any function $errorCopyPayloadBuilder() {
+		return CreateObject("component", "wheels.events.onerror.ErrorCopyPayload");
+	}
+
+	/**
+	 * The development JSON / Markdown error response: the error-page payload plus
+	 * statusCode, with the same status mapping as the HTML page.
+	 */
+	public string function $runOnErrorRenderAgentError(required exception, required string format) {
+		local.wheelsError = $runOnErrorResolveWheelsError(arguments.exception);
+		local.isWheelsError = !StructIsEmpty(local.wheelsError);
+		local.statusCode = local.isWheelsError && StructKeyExists(local.wheelsError, "type")
+			? $wheelsErrorStatusCode(local.wheelsError.type)
+			: 500;
+		// Drop whatever the request wrote before it failed, so the body is only the
+		// JSON or Markdown (best-effort: a no-op once the response is committed).
+		$content(reset = true);
+		$header(statusCode = local.statusCode);
+		local.payload = $agentErrorPayload(local.isWheelsError ? local.wheelsError : arguments.exception);
+		local.payload["statusCode"] = local.statusCode;
+		if (arguments.format == "md") {
+			$header(name = "Content-Type", value = "text/markdown; charset=utf-8");
+			return $errorCopyPayloadBuilder().toMarkdown(local.payload);
+		}
+		$header(name = "Content-Type", value = "application/json; charset=utf-8");
+		return SerializeJSON(local.payload);
+	}
+
+	/**
+	 * The error-page payload for an error, or just its type and message when
+	 * building the payload fails, so the original error is never masked.
+	 */
+	public struct function $agentErrorPayload(required source) {
+		try {
+			return $errorCopyPayloadBuilder().build(wheelsError = arguments.source);
+		} catch (any e) {
+			return {
+				"source" = "wheels-error-page",
+				"exception" = {
+					"type" = IsStruct(arguments.source) && StructKeyExists(arguments.source, "type") && IsSimpleValue(arguments.source.type) ? arguments.source.type : "",
+					"message" = IsStruct(arguments.source) && StructKeyExists(arguments.source, "message") && IsSimpleValue(arguments.source.message) ? arguments.source.message : ""
+				},
+				"payloadError" = e.message
+			};
+		}
+	}
+
 	public string function $runOnErrorRenderException(required exception, required format) {
 		if (arguments.format == "json") {
 			$header(name = "Content-Type", value = "application/json");
@@ -256,7 +361,20 @@ component extends="wheels.Global" implements="wheels.interfaces.events.EventHand
 	}
 
 	public string function $runOnErrorRenderTemplate(required exception, required eventName) {
-		$header(statusCode = 500);
+		// Classify the response status through the same $wheelsErrorStatusCode
+		// allow-list the development path uses ($runOnErrorRenderWheelsError),
+		// instead of returning 500 for every error. Otherwise a production
+		// (showErrorInformation off) request that raised a client-triggerable
+		// Wheels.*NotFound came back 500 rather than 404, and a
+		// Wheels.NotAuthorized came back 500 rather than 403 — the classification
+		// only ran when showErrorInformation was on (#2319/#3075/#3156). A
+		// non-Wheels exception has no resolved type and stays 500.
+		local.wheelsError = $runOnErrorResolveWheelsError(arguments.exception);
+		$header(
+			statusCode = (!StructIsEmpty(local.wheelsError) && StructKeyExists(local.wheelsError, "type"))
+				? $wheelsErrorStatusCode(local.wheelsError.type)
+				: 500
+		);
 
 		local.format = $getRequestFormat();
 		local.formatSpecificTemplate = "#application.wheels.eventPath#/onerror.#local.format#.cfm";
@@ -292,10 +410,20 @@ component extends="wheels.Global" implements="wheels.interfaces.events.EventHand
 		// has been persisted, so aborting here is safe. Runs first on purpose:
 		// nothing else in this event matters for a request being redirected.
 		if (StructKeyExists(request, "wheels") && StructKeyExists(request.wheels, "redirectAfterReloadUrl")) {
-			local.redirectAfterReloadUrl = request.wheels.redirectAfterReloadUrl;
+			// The URL is built from the app-relative path_info: keep it a path on this site
+			// and put the subfolder back (#3948).
+			local.redirectAfterReloadUrl = $reloadRedirectPath(path = request.wheels.redirectAfterReloadUrl);
 			StructDelete(request.wheels, "redirectAfterReloadUrl");
 			$location(url = local.redirectAfterReloadUrl, addToken = false);
 		}
+		// A test run that died before restoring the datasource settings it switched
+		// (its request was killed, so its finally block never ran) leaves markers
+		// behind. Once that run's deadline has passed, put the settings back so the
+		// app does not keep reading and writing the test datasource.
+		if (StructKeyExists(application, "$$$appTestOriginalDataSource")) {
+			application.wo.$recoverStrandedTestRun(force = false);
+		}
+
 		// If the first debug point has not already been set in a reload request we set it here.
 		if ($get("showDebugInformation")) {
 			if (StructKeyExists(request.wheels, "execution")) {

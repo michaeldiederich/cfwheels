@@ -2,15 +2,18 @@ component output="false" {
 
 	// Put variables we just need internally inside a wheels struct.
 	this.wheels = {};
-	// Anchor to this file's directory, not the requested base template's, so
-	// rootPath stays stable when a request bootstraps under a subfolder (e.g.
-	// the test runner) — Hash(rootPath) below seeds this.name, and an unstable
-	// value splits one app across two application scopes (issue #3025/#2887).
+	// Anchor to THIS file's directory (the public front-controller dir), not the
+	// base template's. GetBaseTemplatePath() returns whatever file was originally
+	// requested, so when a request bootstraps under a subfolder (e.g. the test
+	// runner) rootPath would mis-anchor — and since it seeds `this.name` via
+	// Hash(rootPath) below, an unstable value silently splits one app across two
+	// application scopes (the "reload=true fixes it" symptom in issue #3025/#2887).
+	// GetCurrentTemplatePath() is always this Application.cfc's path, so rootPath
+	// stays stable regardless of the requested base template — and is identical to
+	// the old value for a normal front-controller request.
 	this.wheels.rootPath = GetDirectoryFromPath(GetCurrentTemplatePath());
 
 	this.name = createUUID();
-	// Give this application a unique name by taking the path to the root and hashing it.
-	// this.name = Hash(this.wheels.rootPath);
 
 	this.bufferOutput = true;
 
@@ -52,16 +55,33 @@ component output="false" {
 		}
 	}
 
+	// Framework Java resources — the bundled jBCrypt jar used by the global
+	// bcryptHash()/bcryptVerify() helpers. LoadPaths are read at app init, so
+	// the jar must be present under vendor/wheels/resources/java before the
+	// first request; on JVM engines this makes bcrypt run in native Java
+	// instead of the slow pure-CFML Blowfish fallback.
+	if (DirectoryExists(this.wheelsDir & "resources/java")) {
+		if (!StructKeyExists(this, "javaSettings")) {
+			this.javaSettings = {};
+		}
+		if (!StructKeyExists(this.javaSettings, "LoadPaths")) {
+			this.javaSettings.LoadPaths = [];
+		}
+		if (!ArrayFind(this.javaSettings.LoadPaths, this.wheelsDir & "resources/java")) {
+			ArrayAppend(this.javaSettings.LoadPaths, this.wheelsDir & "resources/java");
+		}
+	}
+
 	// Put environment vars into env struct
 	if ( !structKeyExists(this,"env") ) {
 		this.env = {};
-		
+
 		// Load base .env file
 		envFilePath = this.appDir & "../.env";
 		if (fileExists(envFilePath)) {
 			loadEnvFile(envFilePath, this.env);
 		}
-		
+
 		// Determine current environment
 		currentEnv = "";
 		if (structKeyExists(this.env, "WHEELS_ENV")) {
@@ -78,7 +98,7 @@ component output="false" {
 				// Ignore errors accessing system environment
 			}
 		}
-		
+
 		// Load environment-specific .env file if it exists
 		if (len(currentEnv)) {
 			envSpecificPath = this.appDir & "../.env." & currentEnv;
@@ -86,10 +106,29 @@ component output="false" {
 				loadEnvFile(envSpecificPath, this.env);
 			}
 		}
-		
+
 		// Perform variable interpolation
 		performVariableInterpolation(this.env);
 	}
+
+	// Harden the session cookie: httpOnly blocks JavaScript access and sameSite=lax
+	// limits cross-site sends. The secure flag (HTTPS-only cookie) is on whenever the
+	// request that creates the session arrives over HTTPS: directly, or through a
+	// proxy that terminates TLS and sends X-Forwarded-Proto: https. That header can
+	// only turn Secure ON, so trusting it here is safe. It is also on for
+	// WHEELS_ENV=production. The Wheels environment set in config/environment.cfm
+	// can't be read here, because this runs before the application starts. Logging
+	// in rotates the session ID, so an HTTPS login always issues a Secure cookie.
+	// Override in config/app.cfm if your setup differs, e.g.
+	// `this.sessionCookie.secure = true;`.
+	this.sessionCookie = {
+		httpOnly: true,
+		sameSite: "lax",
+		secure: (structKeyExists(variables, "currentEnv") && currentEnv == "production")
+			|| (IsBoolean(cgi.server_port_secure) && cgi.server_port_secure)
+			|| cgi.https == "on"
+			|| cgi.http_x_forwarded_proto == "https"
+	};
 
 	function onServerStart() {}
 
@@ -103,6 +142,8 @@ component output="false" {
 	}
 
 	function onApplicationStart() {
+		application.env = duplicate(this.env);
+
 		// Consume the single-use reload-password handoff left by
 		// $handleRestartAppRequest() for environment-switch restarts (issue #3030).
 		// The framework's switch code in wheels/events/onapplicationstart.cfc runs
@@ -135,12 +176,28 @@ component output="false" {
 	}
 
 	public void function onApplicationEnd( struct ApplicationScope ) {
+		// Release the application-scoped browser-test launcher (headless browser,
+		// node driver process, URLClassLoader handles on the Playwright JARs)
+		// before the scope is discarded. CFML has no destructors, so without this
+		// every applicationStop() reload cycle would orphan those processes.
+		if (StructKeyExists(arguments.applicationScope, "$wheelsBrowserLauncher")) {
+			try {
+				arguments.applicationScope.$wheelsBrowserLauncher.release();
+			} catch (any e) {
+				// Best-effort cleanup — never block application shutdown.
+			}
+		}
+
+		// Run the framework's onApplicationEnd event through the Wheels global.
 		// During applicationStop() teardown on Adobe CF 2023 the LIVE `application`
 		// scope is unreliable — bare `application.wo` can resolve against a
 		// stale/torn-down scope and land on a Java String[], throwing "Element wo
-		// is undefined in a Java object of type class [Ljava.lang.String;" (issue
-		// #3379). The passed-in arguments.applicationScope is the only dependable
-		// reference at shutdown, so route the call through it and guard it.
+		// is undefined in a Java object of type class [Ljava.lang.String;" and
+		// erroring the whole site until a CF service restart (issue #3379). The
+		// passed-in arguments.applicationScope is the only dependable reference at
+		// shutdown (it is what the $wheelsBrowserLauncher cleanup above uses), so
+		// route the call through it and guard so a partially reclaimed scope
+		// degrades to a no-op instead of a hard error.
 		if (
 			StructKeyExists(arguments.applicationScope, "wo")
 			&& StructKeyExists(arguments.applicationScope, "wheels")
@@ -193,13 +250,7 @@ component output="false" {
 
 	public boolean function onRequestStart( string targetPage ) {
 
-		// Added this section so that whenever the format parameter is passed in the URL and it is junit, json or txt then the content will be served without the head and body tags
-		if(structKeyExists(url, "format") && listFindNoCase("junit,json,txt", url.format))
-		{
-			application.contentOnly = true;
-		}else{
-			application.contentOnly = false;
-		}
+		this.$setContentOnlyForFormat();
 
 		// Reload password transport: the Wheels CLI sends it in the
 		// X-Wheels-Reload-Password request header so it stays out of URLs, access
@@ -207,13 +258,34 @@ component output="false" {
 		// the cold-start path and the soft-reload skip all see one value.
 		// ?reload=true&password=... from a browser keeps working unchanged, and
 		// an explicit url.password wins over the header.
-		if (
-			StructKeyExists(url, "reload")
-			&& !StructKeyExists(url, "password")
-			&& IsDefined("cgi.http_x_wheels_reload_password")
-			&& Len(ToString(cgi.http_x_wheels_reload_password))
-		) {
-			url.password = ToString(cgi.http_x_wheels_reload_password);
+		//
+		// On the first request after a reload restart, onApplicationStart runs
+		// inside the request and the framework sets request.cgi. RustCFML then
+		// resolves IsDefined("cgi.<key>") against request.cgi, which holds no
+		// http_x_wheels_reload_password, so the header looked absent.
+		// GetHttpRequestData() still has it, so it is the fallback (#3913). Still
+		// header-only: the password is never read from the form scope.
+		if (StructKeyExists(url, "reload") && !StructKeyExists(url, "password")) {
+			local.reloadPasswordHeader = "";
+			if (IsDefined("cgi.http_x_wheels_reload_password")) {
+				local.reloadPasswordHeader = ToString(cgi.http_x_wheels_reload_password);
+			}
+			if (!Len(local.reloadPasswordHeader)) {
+				try {
+					local.requestHeaders = GetHttpRequestData(false).headers;
+					for (local.headerName in local.requestHeaders) {
+						if (CompareNoCase(local.headerName, "X-Wheels-Reload-Password") == 0) {
+							local.reloadPasswordHeader = ToString(local.requestHeaders[local.headerName]);
+							break;
+						}
+					}
+				} catch (any e) {
+					// No readable raw headers on this engine: nothing to map.
+				}
+			}
+			if (Len(local.reloadPasswordHeader)) {
+				url.password = local.reloadPasswordHeader;
+			}
 		}
 
 		local.lockName = "reloadLock" & this.name;
@@ -236,6 +308,37 @@ component output="false" {
 		// enablePublicComponent per request, because every concurrent request reads them.
 		application.wo.$applyIPDebugAccess();
 
+		local.environmentSwitchAlreadyApplied = this.$isEnvironmentSwitchAlreadyApplied();
+
+		local.reloadAuthorized = this.$authorizeReload(local.environmentSwitchAlreadyApplied);
+		if (local.reloadAuthorized) {
+			this.$restartAppRequest(local.lockName);
+			return false;
+		}
+
+		// Run the rest of the request start code.
+		arguments.componentReference = "wheels.events.EventMethods";
+		application.wo.$simpleLock(
+			name = local.lockName,
+			execute = "$runOnRequestStart",
+			executeArgs = arguments,
+			type = "readOnly",
+			timeout = 180
+		);
+
+		return true;
+	}
+
+	public void function $setContentOnlyForFormat() {
+		if(structKeyExists(url, "format") && listFindNoCase("junit,json,txt", url.format))
+		{
+			application.contentOnly = true;
+		}else{
+			application.contentOnly = false;
+		}
+	}
+
+	public boolean function $isEnvironmentSwitchAlreadyApplied() {
 		// Loop-break for URL environment switches (issue #3030): $buildRedirectUrl()
 		// keeps ?reload=<environment>&password=... on the post-restart redirect so the
 		// framework's switch code (vendor/wheels/events/onapplicationstart.cfc) can see
@@ -245,12 +348,55 @@ component output="false" {
 		// already active, skip the restart and serve the request normally.
 		// Trade-off: ?reload=<current-environment> is a no-op — use ?reload=true for a
 		// same-environment restart.
-		local.environmentSwitchAlreadyApplied = StructKeyExists(url, "reload")
+		return StructKeyExists(url, "reload")
 			&& !IsBoolean(url.reload)
 			&& StructKeyExists(application, "wheels")
 			&& StructKeyExists(application.wheels, "environment")
 			&& application.wheels.environment == url.reload;
+	}
 
+	public boolean function $reloadRateLimited(required string clientIp) {
+		// Same per-IP store and window as wheels/events/onapplicationstart.cfc, so
+		// warm-path and cold-start attempts count against one shared bucket.
+		if (!StructKeyExists(application, "$reloadRateLimit")) {
+			application.$reloadRateLimit = {};
+		}
+		local.reloadRateLimited = false;
+		if (StructKeyExists(application.$reloadRateLimit, arguments.clientIp)) {
+			local.reloadRateLimitEntry = application.$reloadRateLimit[arguments.clientIp];
+			if (local.reloadRateLimitEntry.count >= 5 && DateDiff("n", local.reloadRateLimitEntry.firstAttempt, Now()) < 5) {
+				local.reloadRateLimited = true;
+			}
+			if (DateDiff("n", local.reloadRateLimitEntry.firstAttempt, Now()) >= 5) {
+				StructDelete(application.$reloadRateLimit, arguments.clientIp);
+			}
+		}
+		return local.reloadRateLimited;
+	}
+
+	public void function $recordReloadRefusalReason(required boolean reloadAuthorized) {
+		// Record WHY a requested reload did not fire so the framework's debug
+		// bar can render a development-only notice instead of a silent no-op
+		// (issue #3311). Recording is environment-agnostic — a request-scope
+		// flag, no output; the message text and the development-environment
+		// gate live framework-side in vendor/wheels/events/onrequestend/debug.cfm
+		// so wording can improve without template drift. Wrong-password and
+		// rate-limited attempts deliberately collapse into one generic reason
+		// so the notice adds no oracle on top of $secureCompare().
+		if (!arguments.reloadAuthorized && StructKeyExists(request, "wheels")) {
+			local.reloadPasswordConfigured = StructKeyExists(application.wheels, "reloadPassword")
+				&& Len(application.wheels.reloadPassword);
+			if (!local.reloadPasswordConfigured) {
+				request.wheels.reloadRefusedReason = "emptyPassword";
+			} else if (!StructKeyExists(url, "password")) {
+				request.wheels.reloadRefusedReason = "missingPasswordParam";
+			} else {
+				request.wheels.reloadRefusedReason = "refused";
+			}
+		}
+	}
+
+	public boolean function $authorizeReload(required boolean environmentSwitchAlreadyApplied) {
 		// Reload application properly using applicationStop() if requested.
 		// SECURITY (issue #3062): the gate FAILS CLOSED. A URL-based reload requires a
 		// non-empty configured reloadPassword AND a matching password parameter — an
@@ -260,25 +406,11 @@ component output="false" {
 		// attempts are logged to wheels_security.log with the trusted client IP and
 		// feed the same per-IP rate limit as the cold-start path (5 failed attempts
 		// within 5 minutes locks the source out).
-		local.reloadRequested = StructKeyExists(url, "reload") && !local.environmentSwitchAlreadyApplied;
+		local.reloadRequested = StructKeyExists(url, "reload") && !arguments.environmentSwitchAlreadyApplied;
 		local.reloadAuthorized = false;
 		if (local.reloadRequested && StructKeyExists(application, "wheels") && StructKeyExists(application, "wo")) {
-			// Same per-IP store and window as wheels/events/onapplicationstart.cfc, so
-			// warm-path and cold-start attempts count against one shared bucket.
 			local.reloadClientIp = application.wo.$trustedClientIp();
-			if (!StructKeyExists(application, "$reloadRateLimit")) {
-				application.$reloadRateLimit = {};
-			}
-			local.reloadRateLimited = false;
-			if (StructKeyExists(application.$reloadRateLimit, local.reloadClientIp)) {
-				local.reloadRateLimitEntry = application.$reloadRateLimit[local.reloadClientIp];
-				if (local.reloadRateLimitEntry.count >= 5 && DateDiff("n", local.reloadRateLimitEntry.firstAttempt, Now()) < 5) {
-					local.reloadRateLimited = true;
-				}
-				if (DateDiff("n", local.reloadRateLimitEntry.firstAttempt, Now()) >= 5) {
-					StructDelete(application.$reloadRateLimit, local.reloadClientIp);
-				}
-			}
+			local.reloadRateLimited = this.$reloadRateLimited(local.reloadClientIp);
 			if (
 				!local.reloadRateLimited
 				&& StructKeyExists(application.wheels, "reloadPassword")
@@ -308,51 +440,22 @@ component output="false" {
 					// Fail silently if logging fails
 				}
 			}
-			// Record WHY a requested reload did not fire so the framework's debug
-			// bar can render a development-only notice instead of a silent no-op
-			// (issue #3311). Recording is environment-agnostic — a request-scope
-			// flag, no output; the message text and the development-environment
-			// gate live framework-side in vendor/wheels/events/onrequestend/debug.cfm
-			// so wording can improve without template drift. Wrong-password and
-			// rate-limited attempts deliberately collapse into one generic reason
-			// so the notice adds no oracle on top of $secureCompare().
-			if (!local.reloadAuthorized && StructKeyExists(request, "wheels")) {
-				local.reloadPasswordConfigured = StructKeyExists(application.wheels, "reloadPassword")
-					&& Len(application.wheels.reloadPassword);
-				if (!local.reloadPasswordConfigured) {
-					request.wheels.reloadRefusedReason = "emptyPassword";
-				} else if (!StructKeyExists(url, "password")) {
-					request.wheels.reloadRefusedReason = "missingPasswordParam";
-				} else {
-					request.wheels.reloadRefusedReason = "refused";
-				}
-			}
+			this.$recordReloadRefusalReason(local.reloadAuthorized);
 		}
-		if (local.reloadAuthorized) {
-			application.wo.$debugPoint("total,reload");
-			if (StructKeyExists(url, "lock") && !url.lock) {
-				this.$handleRestartAppRequest();
-			} else {
-				// Case-exact "Application" — see the matching comment in onSessionStart().
-				// A lowercase reference turns every authorized reload into an HTTP 500 on
-				// Adobe CF + case-sensitive filesystems (issue #3053 follow-up).
-				local.executeArgs = {"componentReference" = "Application"};
-				application.wo.$simpleLock(name = local.lockName, execute = "$handleRestartAppRequest", type = "exclusive", timeout = 180, executeArgs = local.executeArgs);
-			}
-			return false; // Stop processing this request after restart
+		return local.reloadAuthorized;
+	}
+
+	public void function $restartAppRequest(required string lockName) {
+		application.wo.$debugPoint("total,reload");
+		if (StructKeyExists(url, "lock") && !url.lock) {
+			this.$handleRestartAppRequest();
+		} else {
+			// Case-exact "Application" — see the matching comment in onSessionStart().
+			// A lowercase reference turns every authorized reload into an HTTP 500 on
+			// Adobe CF + case-sensitive filesystems (issue #3053 follow-up).
+			local.executeArgs = {"componentReference" = "Application"};
+			application.wo.$simpleLock(name = arguments.lockName, execute = "$handleRestartAppRequest", type = "exclusive", timeout = 180, executeArgs = local.executeArgs);
 		}
-
-		// Run the rest of the request start code.
-		arguments.componentReference = "wheels.events.EventMethods";
-		application.wo.$simpleLock(
-			name = local.lockName,
-			execute = "$runOnRequestStart",
-			executeArgs = arguments,
-			type = "readOnly",
-			timeout = 180
-		);
-
-		return true;
 	}
 
 	public boolean function onRequest( string targetPage ) {
@@ -442,7 +545,7 @@ component output="false" {
 		// already lost — fall back to a minimal HTML response rather than
 		// cascading into "The key [WO] does not exist." (issue ##2773).
 		if (!StructKeyExists(application, "wo")) {
-			$renderMinimalError(arguments.Exception, arguments.EventName ?: "");
+			$renderMinimalError(arguments.Exception, arguments.EventName ?: "", true);
 			return;
 		}
 
@@ -476,7 +579,7 @@ component output="false" {
 			// reclaimed before the dereferences below run, so degrade to the
 			// minimal fallback rather than cascade the torn-down-scope error
 			// over the real one.
-			$renderMinimalError(arguments.Exception, arguments.EventName ?: "");
+			$renderMinimalError(arguments.Exception, arguments.EventName ?: "", !StructKeyExists(application, "wheels"));
 		}
 	}
 
@@ -484,11 +587,23 @@ component output="false" {
 	// Wheels global never came up (issue ##2773), and the application scope
 	// being torn down mid-onError (issue ##3379). Kept in one place so both
 	// paths render identically.
-	private void function $renderMinimalError( required any Exception, string eventName = "" ) {
-		setting requestTimeout=30;
+	private void function $renderMinimalError( required any Exception, string eventName = "", boolean startupPhase = true ) {
+		// Extend the request timeout before logging so WriteLog can run even when
+		// the error is a request timeout — the non-fallback path above does the
+		// same with onErrorRequestTimeout (issue ##3965). Otherwise a stuck
+		// request swallows the wheels.log entry this page points the operator at.
+		try {
+			local.fallbackTimeout = 30;
+			if (StructKeyExists(application, "wheels") && StructKeyExists(application.wheels, "onErrorRequestTimeout")) {
+				local.fallbackTimeout = application.wheels.onErrorRequestTimeout;
+			}
+			setting requestTimeout=local.fallbackTimeout;
+		} catch (any timeoutErr) {
+			// setting may itself fail on a fully torn-down request; keep going.
+		}
 		// Write the real failure to wheels.log first, so the page's "check
 		// the server log" points at an entry that exists (issue ##3671).
-		$logStartupFailure(arguments.Exception, arguments.eventName);
+		$logStartupFailure(arguments.Exception, arguments.eventName, arguments.startupPhase);
 		// Surface a real 5xx so monitoring tools and CDNs don't cache this
 		// failure as a successful response. Use a plain struct for
 		// attributeCollection — Adobe CF 2023/2025 reject the `arguments`
@@ -500,7 +615,11 @@ component output="false" {
 			// Header may already have been written; the body still renders.
 		}
 		WriteOutput("<h1>Application Error</h1>");
-		WriteOutput("<p>Wheels failed to initialize. Check the server log (wheels.log) for details.</p>");
+		if (arguments.startupPhase) {
+			WriteOutput("<p>Wheels failed to initialize. Check the server log (wheels.log) for details.</p>");
+		} else {
+			WriteOutput("<p>The application could not complete this request. Check the server log (wheels.log) for details.</p>");
+		}
 		// How much to show follows the app's showErrorInformation setting
 		// (false in production by default) once startup got far enough to set
 		// it: the root cause in full, or nothing beyond the log pointer. Before
@@ -582,11 +701,11 @@ component output="false" {
 	// detail and first tag-context frame, plus the wrapper. Runs on the
 	// last-ditch error path: it must never throw, and it only logs (the
 	// rendered page stays minimal).
-	private void function $logStartupFailure( required any Exception, string eventName = "" ) {
+	private void function $logStartupFailure( required any Exception, string eventName = "", boolean startupPhase = true ) {
 		try {
 			local.root = $startupFailureRoot(arguments.Exception);
 
-			local.text = "Wheels failed to initialize";
+			local.text = arguments.startupPhase ? "Wheels failed to initialize" : "Wheels could not complete the request";
 			if (Len(arguments.eventName)) {
 				local.text &= " in " & arguments.eventName;
 			}
@@ -774,7 +893,6 @@ component output="false" {
 		// and on Adobe CF an unscoped url resolves to a local of that name first,
 		// turning every password reload into an HTTP 500 (issue #3053, CLAUDE.md
 		// anti-pattern #11 — reserved scope names).
-		// Determine the base URL
 		if (StructKeyExists(cgi, "path_info") && Len(cgi.path_info)) {
 			local.redirectPath = cgi.path_info;
 		} else if (StructKeyExists(cgi, "path_info")) {
@@ -818,30 +936,68 @@ component output="false" {
 			local.stripParams = "lock";
 		}
 
-		// Process query string parameters, removing reload-related ones
 		if (StructKeyExists(cgi, "query_string") && Len(cgi.query_string)) {
 			local.oldQueryString = ListToArray(cgi.query_string, "&");
 			local.newQueryString = [];
 			local.iEnd = ArrayLen(local.oldQueryString);
-			
+
 			for (local.i = 1; local.i <= local.iEnd; local.i++) {
 				local.keyValue = local.oldQueryString[local.i];
 				local.key = ListFirst(local.keyValue, "=");
-				
-				// Remove reload-related parameters
+
 				if (!ListFindNoCase(local.stripParams, local.key)) {
 					ArrayAppend(local.newQueryString, local.keyValue);
 				}
 			}
-			
-			// Add query string to URL if any parameters remain
+
 			if (ArrayLen(local.newQueryString)) {
 				local.queryString = ArrayToList(local.newQueryString, "&");
 				local.redirectPath = "#local.redirectPath#?#local.queryString#";
 			}
 		}
 
+		// Keep the redirect a path on this app and put the subfolder back on a subpath
+		// install, as the framework's own reload redirect does. Fall back to normalising
+		// the path here when the framework helper isn't available (an older vendor/wheels,
+		// or a partial application scope).
+		local.redirectPathResolved = false;
+		try {
+			if (StructKeyExists(application, "wo")) {
+				local.redirectPath = application.wo.$reloadRedirectPath(path = local.redirectPath);
+				local.redirectPathResolved = true;
+			}
+		} catch (any e) {
+			// No such helper (an older vendor/wheels): use the fallback below.
+		}
+		if (!local.redirectPathResolved) {
+			local.redirectPath = this.$normaliseRedirectPath(local.redirectPath);
+		}
+
 		return local.redirectPath;
+	}
+
+	/**
+	 * Fallback for $buildRedirectUrl(): reduces the path's leading run of slashes,
+	 * backslashes, spaces and control characters to a single "/".
+	 */
+	public string function $normaliseRedirectPath(required string path) {
+		local.len = Len(arguments.path);
+		local.i = 1;
+		while (local.i <= local.len) {
+			local.code = Asc(Mid(arguments.path, local.i, 1));
+			if (local.code == 47 || local.code == 92 || local.code <= 32 || local.code == 127) {
+				local.i++;
+			} else {
+				break;
+			}
+		}
+		if (local.i == 1) {
+			return arguments.path;
+		}
+		if (local.i > local.len) {
+			return "/";
+		}
+		return "/" & Mid(arguments.path, local.i, local.len - local.i + 1);
 	}
 
 	/**
@@ -850,33 +1006,28 @@ component output="false" {
 	private void function loadEnvFile(required string filePath, required struct envStruct) {
 		local.envFile = fileRead(arguments.filePath);
 		local.tempStruct = {};
-		
+
 		if (isJSON(local.envFile)) {
 			local.tempStruct = deserializeJSON(local.envFile);
 		} else {
-			// Parse as properties file with enhanced features
 			local.lines = listToArray(local.envFile, chr(10));
-			
+
 			for (local.line in local.lines) {
 				local.trimmedLine = trim(local.line);
-				
-				// Skip empty lines and comments
+
 				if (!len(local.trimmedLine) || left(local.trimmedLine, 1) == "##") {
 					continue;
 				}
-				
-				// Parse key=value pairs
+
 				if (find("=", local.trimmedLine)) {
 					local.key = trim(listFirst(local.trimmedLine, "="));
 					local.value = trim(listRest(local.trimmedLine, "="));
-					
-					// Remove surrounding quotes if present
+
 					if ((left(local.value, 1) == '"' && right(local.value, 1) == '"') ||
 						(left(local.value, 1) == "'" && right(local.value, 1) == "'")) {
 						local.value = mid(local.value, 2, len(local.value) - 2);
 					}
-					
-					// Type casting for boolean and numeric values
+
 					// Type casting for boolean and numeric values. STRING comparison,
 					// never `==`: Lucee compares `"1.0" == "true"` NUMERICALLY (1 == 1,
 					// so true), which turned every .env value of numeric 1 into the BOOLEAN
@@ -884,47 +1035,42 @@ component output="false" {
 					if (Compare(lCase(local.value), "true") == 0 || Compare(lCase(local.value), "false") == 0) {
 						local.value = (Compare(lCase(local.value), "true") == 0);
 					} else if (isNumeric(local.value) && !find(".", local.value)) {
-						// Only convert integers, leave decimals as strings
 						local.value = val(local.value);
 					}
-					
+
 					local.tempStruct[local.key] = local.value;
 				}
 			}
 		}
-		
-		// Merge into the main env struct
+
 		for (local.key in local.tempStruct) {
 			arguments.envStruct[local.key] = local.tempStruct[local.key];
 		}
 	}
-	
+
 	/**
 	 * Perform variable interpolation on env values using ${VAR} syntax
 	 */
 	private void function performVariableInterpolation(required struct envStruct) {
-		local.maxIterations = 10; // Prevent infinite loops
+		local.maxIterations = 10;
 		local.iteration = 0;
 		local.hasChanges = true;
-		
+
 		while (local.hasChanges && local.iteration < local.maxIterations) {
 			local.hasChanges = false;
 			local.iteration++;
-			
+
 			for (local.key in arguments.envStruct) {
 				local.value = arguments.envStruct[local.key];
-				
+
 				if (isSimpleValue(local.value) && isString(local.value)) {
 					local.newValue = local.value;
-					
-					// Find all ${VAR} patterns
+
 					local.matches = reMatchNoCase("\$\{([^}]+)\}", local.value);
-					
+
 					for (local.match in local.matches) {
-						// Extract variable name
 						local.varName = reReplaceNoCase(local.match, "\$\{([^}]+)\}", "\1");
-						
-						// Replace with actual value if it exists
+
 						if (structKeyExists(arguments.envStruct, local.varName)) {
 							local.replacement = arguments.envStruct[local.varName];
 							if (isSimpleValue(local.replacement)) {
@@ -933,13 +1079,13 @@ component output="false" {
 							}
 						}
 					}
-					
+
 					arguments.envStruct[local.key] = local.newValue;
 				}
 			}
 		}
 	}
-	
+
 	/**
 	 * Helper to check if a value is a string (not boolean or numeric after parsing)
 	 */

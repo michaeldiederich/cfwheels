@@ -1,0 +1,19 @@
+---
+title: "wheels deploy server"
+description: Host-level operations — exec arbitrary commands, bootstrap Docker on a fresh host.
+type: reference
+sidebar:
+  label: "server"
+  order: 70
+---
+
+Host-level operations that don't fit in the app/proxy/accessory model.
+
+The documented shell forms are the **flat aliases** `wheels deploy exec` and `wheels deploy bootstrap`. Older CLI runtimes intercepted the nested `wheels deploy server <verb>` form in the top-level `server` command ([#2677](https://github.com/wheels-dev/wheels/issues/2677)), which is why the flat aliases exist ([#2690](https://github.com/wheels-dev/wheels/pull/2690)). On the current runtime the nested form also reaches deploy dispatch.
+
+## Verbs
+
+| Verb | Shell form | Purpose |
+|------|------------|---------|
+| [`exec`](/v4-2-0/command-line-tools/commands/deploy/server/exec/) | `wheels deploy exec <command>` | Run a command on every host (optionally filtered). |
+| [`bootstrap`](/v4-2-0/command-line-tools/commands/deploy/server/bootstrap/) | `wheels deploy bootstrap` | Install Docker on a fresh host (idempotent). |

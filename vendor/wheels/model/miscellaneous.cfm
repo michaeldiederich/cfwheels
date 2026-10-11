@@ -21,11 +21,22 @@
 	}
 
 	/**
-	 * Deletes all queries stored during the request for this model.
+	 * Clears the ENTIRE per-request query cache — every model's slot, not just this model's (#4429).
+	 *
+	 * A finder's result is cached in the base model's slot keyed by its SQL, so a query that joins
+	 * another model through `include=` lives in the base model's slot. Clearing only the writing
+	 * model's slot left such a cross-model query returning this model's pre-write columns for the rest
+	 * of the request. Every ORM write path funnels through here (create / update / delete / *All /
+	 * *ByKey / the #4397 soft-delete UPDATE via $runDeleteStatement), so clearing all of it here means
+	 * no write path can forget the cross-model case. The cache is request-scoped, so re-running the
+	 * affected reads after a write is both correct and cheap. Raw (non-ORM) writes are the caller's job
+	 * via `forgetCachedQueries(all = true)`.
 	 */
 	public void function $clearRequestCache() {
-		$ensureRequestQueryCache();
-		request.wheels["$queryCache"][variables.wheels.class.modelName] = {};
+		if (!StructKeyExists(request, "wheels")) {
+			request.wheels = {};
+		}
+		request.wheels["$queryCache"] = {};
 	}
 
 	/**
@@ -64,6 +75,7 @@
 	 * @name Name of the table to map this model to.
 	 */
 	public void function table(required any name) {
+		$checkArguments(args = arguments, name = "table");
 		variables.wheels.class.tableName = arguments.name;
 	}
 
@@ -128,9 +140,9 @@
 	 */
 	public boolean function exists(any key, string where, boolean reload, any parameterize, boolean includeSoftDeletes) {
 		$args(name = "exists", args = arguments);
-		if ($get("showErrorInformation") && StructKeyExists(arguments, "key") && StructKeyExists(arguments, "where")) {
-			Throw(type = "Wheels.IncorrectArguments", message = "You cannot pass in both `key` and `where`.");
-		}
+		// With both `key` and `where` (for example through a scope chain or the
+		// query builder), findByKey narrows the where by the key, the same in
+		// every environment.
 		arguments.select = primaryKey();
 		arguments.returnAs = "query";
 		arguments.callbacks = false;
@@ -206,7 +218,7 @@
 	 * Calling `tableName()` with an argument has always been a silent no-op (CFML
 	 * accepts the extra argument and the model keeps its convention table), a trap
 	 * some 4.0-era docs taught as a setter. When error information is shown
-	 * (development / testing — the same gate `exists()` uses above) it now fails
+	 * (development / testing, i.e. `showErrorInformation`) it now fails
 	 * loud; in production it stays a no-op so an upgrade never breaks a running
 	 * app. See issue #3079.
 	 *
@@ -319,6 +331,52 @@
 	}
 
 	/**
+	 * Internal function. SQLite stores dates as TEXT and Wheels binds them as varchar. CFML's
+	 * default string for a date object is "{ts '...'}", which would be stored verbatim and then
+	 * fail to read from a DATETIME column, so a date is written as ISO-8601 text. Shared by every
+	 * path that binds a property value: save() ($buildQueryParamValues), updateAll() and key
+	 * WHERE clauses (#4147).
+	 *
+	 * Scoped by the property, because every SQLite text column binds as varchar: a date column
+	 * (validation type "datetime": a declared date type, or a TEXT column the name heuristic
+	 * treats as a date) formats any date value; any other column is rewritten only when the value
+	 * would otherwise be stored as a CFML ODBC literal ({ts '...'}, {d '...'}, {t '...'}), so
+	 * date-like text such as "1-2-3" or "12:30" is kept as written.
+	 */
+	public any function $sqliteDateParamValue(
+		required any value,
+		required string type,
+		required boolean isNull,
+		string property = ""
+	) {
+		if (
+			$get("adapterName") neq "SQLiteModel"
+			|| arguments.type neq "cf_sql_varchar"
+			|| arguments.isNull
+			|| !IsSimpleValue(arguments.value)
+			|| !Len(arguments.value)
+			|| !IsDate(arguments.value)
+			|| IsNumeric(arguments.value)
+		) {
+			return arguments.value;
+		}
+		if (!$isDateProperty(arguments.property) && !ReFind("^\{(ts|d|t) '", ToString(arguments.value))) {
+			return arguments.value;
+		}
+		return DateFormat(arguments.value, "yyyy-mm-dd") & " " & TimeFormat(arguments.value, "HH:mm:ss");
+	}
+
+	/**
+	 * Internal function. True when Wheels validates the property as a date.
+	 */
+	public boolean function $isDateProperty(required string property) {
+		return Len(arguments.property)
+			&& StructKeyExists(variables.wheels.class.properties, arguments.property)
+			&& StructKeyExists(variables.wheels.class.properties[arguments.property], "validationtype")
+			&& variables.wheels.class.properties[arguments.property].validationtype == "datetime";
+	}
+
+	/**
 	 * Internal function.
 	 */
 	public struct function $buildQueryParamValues(required string property) {
@@ -329,23 +387,7 @@
 		local.rv.scale = variables.wheels.class.properties[arguments.property].scale;
 		local.rv.null = (!Len(this[arguments.property]) && variables.wheels.class.properties[arguments.property].nullable);
 
-		// SQLite stores datetimes as TEXT and binds as varchar. CFML's default
-		// toString of a date object is "{ts '...'}" — that string gets stored
-		// verbatim in the TEXT column, breaking DateFormat() and direct DB
-		// inspection on read. Pre-format any date-shaped value as ISO-8601 so
-		// the column ends up with clean human-readable values. The format is
-		// idempotent for already-clean strings, so re-running is safe.
-		if (
-			$get("adapterName") eq "SQLiteModel"
-			&& local.rv.type eq "cf_sql_varchar"
-			&& !local.rv.null
-			&& IsSimpleValue(local.rv.value)
-			&& Len(local.rv.value)
-			&& IsDate(local.rv.value)
-			&& !IsNumeric(local.rv.value)
-		) {
-			local.rv.value = DateFormat(local.rv.value, "yyyy-mm-dd") & " " & TimeFormat(local.rv.value, "HH:mm:ss");
-		}
+		local.rv.value = $sqliteDateParamValue(value = local.rv.value, type = local.rv.type, isNull = local.rv.null, property = arguments.property);
 
 		// Convert date strings to proper date for datetime types (engine-specific parsing)
 		if ($engineAdapter().isBoxLang() && (Len(local.rv.value) && !local.rv.null && 

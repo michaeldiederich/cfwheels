@@ -1,6 +1,15 @@
 component extends="wheels.databaseAdapters.Base" output=false {
 
 	/**
+	 * Oracle 19c and earlier accept at most 1000 expressions in one IN list
+	 * (ORA-01795). Oracle 23ai has no such limit, but splitting there returns the
+	 * same rows, so lists are split at 1000 on every release (#3906).
+	 */
+	public numeric function $maxInListSize() {
+		return 1000;
+	}
+
+	/**
 	 * Oracle reports unquoted identifiers in uppercase, so lowercase
 	 * auto-derived property names — otherwise models expose `FIRSTNAME`
 	 * instead of `firstname`. See Base.$lowerCaseColumnNames().
@@ -10,13 +19,86 @@ component extends="wheels.databaseAdapters.Base" output=false {
 	}
 
 	/**
+	 * Internal function. The cf_sql type for an Oracle NUMBER column. A whole-number column with
+	 * precision 11 or more (NUMBER(11..38, 0), including Oracle's INTEGER, which is NUMBER(38) and
+	 * common for identity ids) holds values beyond 32 bits, so it binds as BIGINT (#4086, #4089).
+	 * As INTEGER, an id above 2,147,483,647 was clamped on bind and a find, update or delete by it
+	 * acted on a different row. NUMBER(1..10, 0) and an unknown precision stay INTEGER; a
+	 * fractional scale is NUMERIC.
+	 */
+	public string function $numberType(string scale = "", string precision = "") {
+		if (arguments.scale NEQ 0) {
+			return "cf_sql_numeric";
+		}
+		if (IsNumeric(arguments.precision) && arguments.precision > 10) {
+			return "cf_sql_bigint";
+		}
+		return "cf_sql_integer";
+	}
+
+	/**
+	 * Internal function. An integer param whose value is beyond the signed 64-bit range binds as
+	 * text (#4162). NUMBER(20..38, 0) columns can hold such values, but no numeric cf_sql type
+	 * binds them exactly: cf_sql_bigint is clamped (Lucee) or wrapped (BoxLang), and
+	 * cf_sql_numeric / cf_sql_decimal go through a double. Oracle converts a character value
+	 * compared with or stored into a NUMBER exactly. Only pure digit strings (an optional leading
+	 * "-", no decimal point or grouping) qualify, so NLS settings can't change the conversion.
+	 */
+	public struct function $queryParams(required struct settings) {
+		local.rv = super.$queryParams(argumentCollection = arguments);
+		if (
+			ListFindNoCase("cf_sql_bigint,cf_sql_integer", local.rv.cfsqltype)
+			&& !(StructKeyExists(local.rv, "null") && local.rv.null)
+			&& $integerValuesNeedTextBind(local.rv)
+		) {
+			local.rv.cfsqltype = "cf_sql_varchar";
+		}
+		return local.rv;
+	}
+
+	/**
+	 * Internal function. True when every value of a query param (one value, or each element of an
+	 * IN list) is a pure digit string and at least one is outside the cf_sql_bigint range.
+	 * Compared as digit strings, never through a double.
+	 */
+	public boolean function $integerValuesNeedTextBind(required struct param) {
+		local.range = $integerKeyRange(sqlType = "cf_sql_bigint");
+		local.values = StructKeyExists(arguments.param, "list") && arguments.param.list
+			? ListToArray(arguments.param.value, arguments.param.separator)
+			: [arguments.param.value];
+		local.state = {beyond = false};
+		for (local.value in local.values) {
+			if (!IsSimpleValue(local.value) || !ReFind("^-?[0-9]+$", local.value)) {
+				return false;
+			}
+			local.digits = $canonicalIntegerString(local.value);
+			if (
+				$compareIntegerStrings(local.digits, local.range.min) < 0
+				|| $compareIntegerStrings(local.digits, local.range.max) > 0
+			) {
+				local.state.beyond = true;
+			}
+		}
+		return local.state.beyond;
+	}
+
+	/**
 	 * Map database types to the ones used in CFML.
 	 */
-	public string function $getType(required string type, string scale, string details) {
+	public string function $getType(required string type, string scale, string details, string precision = "") {
+		// Oracle has no BIGINT column type, but a calculated property's dataType is a portable
+		// name, which every other adapter maps (#4089).
+		if (ListFindNoCase("bigint,int8", arguments.type)) {
+			return "cf_sql_bigint";
+		}
 		switch (arguments.type) {
 			case "blob":
 			case "bfile":
 				local.rv = "cf_sql_binary";
+				break;
+			// Native BOOLEAN (Oracle 23ai+), which the migrator emits for t.boolean() (#3897).
+			case "boolean":
+				local.rv = "cf_sql_bit";
 				break;
 			case "char":
 			case "nchar":
@@ -39,11 +121,7 @@ component extends="wheels.databaseAdapters.Base" output=false {
 				local.rv = "cf_sql_numeric";
 				break;
 			case "number":
-				if (arguments.scale EQ 0) {
-					local.rv = "cf_sql_integer";
-				} else {
-					local.rv = "cf_sql_numeric";
-				}
+				local.rv = $numberType(scale = arguments.scale, precision = arguments.precision);
 				break;
 			case "real":
 			case "binary_float":
@@ -279,6 +357,26 @@ component extends="wheels.databaseAdapters.Base" output=false {
 		} catch (any e) {
 			return "";
 		}
+	}
+
+	/**
+	 * Oracle compares a date or timestamp column with a quoted string by parsing the
+	 * string with the session's NLS date format, so '2000-01-01 00:00:00' written into
+	 * the SQL text (parameterize=false, including a {ts} date in a where string) fails
+	 * with ORA-01843 under the default format. A value in ISO form is written as an ANSI
+	 * DATE or TIMESTAMP literal instead, which reads the same under any session
+	 * format (#4084). Anything else is written as before.
+	 */
+	public string function $inlineValue(required string str, string sqlType = "CF_SQL_VARCHAR") {
+		if (ListFindNoCase("cf_sql_timestamp,cf_sql_date", arguments.sqlType)) {
+			if (ReFind("^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?$", arguments.str)) {
+				return "TIMESTAMP '" & arguments.str & "'";
+			}
+			if (ReFind("^[0-9]{4}-[0-9]{2}-[0-9]{2}$", arguments.str)) {
+				return "DATE '" & arguments.str & "'";
+			}
+		}
+		return super.$inlineValue(argumentCollection = arguments);
 	}
 
 	/**

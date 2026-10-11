@@ -44,18 +44,29 @@ component extends="wheels.wheelstest.system.BaseSpec" {
 		return arguments.hex & "  " & variables.zipName & chr(10);
 	}
 
-	/** Routes keyed by path; a missing key 404s (the stub's fixed status). */
+	/**
+	 * Routes keyed by path; a missing key 404s (the stub's fixed status).
+	 * "HOLD" passes through: the stub reads that request and never answers.
+	 */
 	private any function startStub(required struct routes) {
 		var bytesByPath = {};
 		for (var path in arguments.routes) {
-			bytesByPath[path] = stubFactory.binaryResponse(200, arguments.routes[path]);
+			var body = arguments.routes[path];
+			bytesByPath[path] = (!isBinary(body) && body == "HOLD") ? "HOLD" : stubFactory.binaryResponse(200, body);
 		}
 		return new cli.lucli.tests.StubHttpServer(statusCode = 404, bindAddress = "127.0.0.1", routes = bytesByPath);
 	}
 
-	private any function fetchModule(required any stub, required string home) {
+	/**
+	 * Short download timeouts: on Lucee a cfhttp response that completes
+	 * before the tag starts waiting returns only after the whole timeout, and
+	 * a local stub answers fast enough to hit that (#4232), so a spec must
+	 * never wait on the real 30 s / 300 s limits.
+	 */
+	private any function fetchModule(required any stub, required string home, struct timeouts = {checksum: 5, bundle: 5}) {
 		var m = new cli.lucli.Module(cwd = variables.tempRoot);
 		prepareMock(m);
+		m.$("$docsFetchTimeouts", arguments.timeouts);
 		m.$("$resolveLucliHome", arguments.home);
 		m.$("$docsBundleUrl", "http://127.0.0.1:#arguments.stub.getPort()#/#variables.zipName#");
 		m.$("$docsMountIntoWebroot");
@@ -148,6 +159,27 @@ component extends="wheels.wheelstest.system.BaseSpec" {
 				expect(arrayLen(tempFiles())).toBe(before);
 			});
 
+			it("gives up on a release server that answers nothing, within the download timeout", () => {
+				var home = newHome();
+				var before = arrayLen(tempFiles());
+				var stub = startStub({
+					"/#zipName#": zipBytes,
+					"/#zipName#.sha512": "HOLD"
+				});
+				var started = getTickCount();
+				try {
+					var thrown = runDocs(fetchModule(stub, home, {checksum: 2, bundle: 2}));
+				} finally {
+					stub.stop();
+				}
+				var elapsed = getTickCount() - started;
+				expect(thrown).toBe("Wheels.DocsFetchFailed");
+				expect(elapsed).toBeLT(15000, "docs fetch waited #elapsed# ms on a server that never answered");
+				expect(directoryExists(home & "/docs/#version#")).toBeFalse();
+				expect(strayEntries(home)).toBeEmpty();
+				expect(arrayLen(tempFiles())).toBe(before);
+			});
+
 			it("keeps an existing install when a --force re-fetch does not match", () => {
 				var home = newHome();
 				directoryCreate(home & "/docs/#version#", true);
@@ -224,11 +256,174 @@ component extends="wheels.wheelstest.system.BaseSpec" {
 				expect(strayEntries(home)).toBeEmpty();
 			});
 
+			it("installs when the CLI home path contains a space", () => {
+				var home = variables.workDir & "/home sp ace-" & createUUID();
+				directoryCreate(home & "/docs", true);
+				var stub = startStub({
+					"/#zipName#": zipBytes,
+					"/#zipName#.sha512": checksumFile(zipSha)
+				});
+				try {
+					expect(runDocs(fetchModule(stub, home))).toBe("");
+				} finally {
+					stub.stop();
+				}
+				expect(fileExists(home & "/docs/#version#/manifest.json")).toBeTrue();
+				expect(fileExists(home & "/docs/#version#/guides/index.html")).toBeTrue();
+				expect(strayEntries(home)).toBeEmpty();
+			});
+
+			it("fails an archive entry that would unpack outside the docs directory", () => {
+				var home = newHome();
+				var evilZip = variables.workDir & "/evil-" & createUUID() & ".zip";
+				var zos = createObject("java", "java.util.zip.ZipOutputStream").init(
+					createObject("java", "java.io.FileOutputStream").init(evilZip)
+				);
+				zos.putNextEntry(createObject("java", "java.util.zip.ZipEntry").init("../escaped.txt"));
+				zos.write(charsetDecode("escaped", "utf-8"));
+				zos.closeEntry();
+				zos.close();
+				var evilBytes = fileReadBinary(evilZip);
+				var stub = startStub({
+					"/#zipName#": evilBytes,
+					"/#zipName#.sha512": checksumFile(lCase(hash(evilBytes, "SHA-512")))
+				});
+				try {
+					expect(runDocs(fetchModule(stub, home))).toBe("Wheels.DocsFetchFailed");
+				} finally {
+					stub.stop();
+				}
+				expect(fileExists(home & "/docs/escaped.txt")).toBeFalse();
+				expect(directoryExists(home & "/docs/#version#")).toBeFalse();
+				expect(strayEntries(home)).toBeEmpty();
+			});
+
+			it("installs a bundle whose archive has a ./ root directory entry", () => {
+				var home = newHome();
+				var dotZip = variables.workDir & "/dot-" & createUUID() & ".zip";
+				var zos = createObject("java", "java.util.zip.ZipOutputStream").init(
+					createObject("java", "java.io.FileOutputStream").init(dotZip)
+				);
+				zos.putNextEntry(createObject("java", "java.util.zip.ZipEntry").init("./"));
+				zos.closeEntry();
+				zos.putNextEntry(createObject("java", "java.util.zip.ZipEntry").init("manifest.json"));
+				zos.write(charsetDecode(serializeJSON({docsVersion: variables.version}), "utf-8"));
+				zos.closeEntry();
+				zos.close();
+				var dotBytes = fileReadBinary(dotZip);
+				var stub = startStub({
+					"/#zipName#": dotBytes,
+					"/#zipName#.sha512": checksumFile(lCase(hash(dotBytes, "SHA-512")))
+				});
+				try {
+					expect(runDocs(fetchModule(stub, home))).toBe("");
+				} finally {
+					stub.stop();
+				}
+				expect(fileExists(home & "/docs/#version#/manifest.json")).toBeTrue();
+			});
+
 			it("fails when the framework version cannot be determined", () => {
 				var bareRoot = variables.workDir & "/not-a-project-" & createUUID();
 				directoryCreate(bareRoot, true);
 				var m = new cli.lucli.Module(cwd = bareRoot);
 				expect(runDocs(m)).toBe("Wheels.DocsFetchFailed");
+			});
+
+		});
+
+		describe("wheels docs fetch — an installed bundle and offline mode", () => {
+
+			afterEach(() => {
+				structDelete(request, "$wheelsOffline");
+			});
+
+			it("mounts an already-installed bundle into the webroot without downloading", () => {
+				var home = newHome();
+				directoryCreate(home & "/docs/#version#", true);
+				var stub = startStub({});
+				try {
+					var m = fetchModule(stub, home);
+					expect(runDocs(m)).toBe("");
+					var requested = stub.requests();
+				} finally {
+					stub.stop();
+				}
+				expect(m.$count("$docsMountIntoWebroot")).toBe(1);
+				expect(requested).toBeEmpty();
+			});
+
+			it("refuses the download with --offline, before any network access", () => {
+				var home = newHome();
+				var stub = startStub({
+					"/#zipName#": zipBytes,
+					"/#zipName#.sha512": checksumFile(zipSha)
+				});
+				try {
+					var m = fetchModule(stub, home);
+					var state = {type = "", message = ""};
+					m.__arguments = ["fetch", "--offline"];
+					try {
+						m.docs();
+					} catch (any e) {
+						state.type = e.type;
+						state.message = e.message;
+					}
+					var requested = stub.requests();
+				} finally {
+					stub.stop();
+				}
+				expect(state.type).toBe("Wheels.DocsFetchFailed");
+				expect(state.message).toInclude("--offline");
+				expect(requested).toBeEmpty();
+				expect(directoryExists(home & "/docs/#version#")).toBeFalse();
+				expect(m.$count("$docsMountIntoWebroot")).toBe(0);
+			});
+
+			it("still mounts an already-installed bundle with --offline", () => {
+				var home = newHome();
+				directoryCreate(home & "/docs/#version#", true);
+				var stub = startStub({});
+				try {
+					var m = fetchModule(stub, home);
+					expect(runDocs(m, ["fetch", "--offline"])).toBe("");
+					var requested = stub.requests();
+				} finally {
+					stub.stop();
+				}
+				expect(m.$count("$docsMountIntoWebroot")).toBe(1);
+				expect(requested).toBeEmpty();
+			});
+
+			it("runs the default fetch for a bare `wheels docs --offline`", () => {
+				var home = newHome();
+				directoryCreate(home & "/docs/#version#", true);
+				var stub = startStub({});
+				try {
+					var m = fetchModule(stub, home);
+					expect(runDocs(m, ["--offline"])).toBe("");
+				} finally {
+					stub.stop();
+				}
+				expect(m.$count("$docsMountIntoWebroot")).toBe(1);
+			});
+
+			it("refuses a --force re-fetch with --offline and keeps the installed bundle", () => {
+				var home = newHome();
+				directoryCreate(home & "/docs/#version#", true);
+				fileWrite(home & "/docs/#version#/marker.txt", "previous install");
+				var stub = startStub({
+					"/#zipName#": zipBytes,
+					"/#zipName#.sha512": checksumFile(zipSha)
+				});
+				try {
+					expect(runDocs(fetchModule(stub, home), ["fetch", "--force", "--offline"])).toBe("Wheels.DocsFetchFailed");
+					var requested = stub.requests();
+				} finally {
+					stub.stop();
+				}
+				expect(requested).toBeEmpty();
+				expect(fileExists(home & "/docs/#version#/marker.txt")).toBeTrue();
 			});
 
 		});

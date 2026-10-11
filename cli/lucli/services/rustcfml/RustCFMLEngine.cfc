@@ -32,7 +32,7 @@ component {
 	 * check-version.sh bumps ENGINE_VERSION, and RustCFMLEnginePinSpec fails
 	 * on drift (#3812).
 	 */
-	variables.engineVersion = "v0.693.0";
+	variables.engineVersion = "v0.730.0";
 
 	/**
 	 * sha256 of each release asset of the pinned version. install() refuses a
@@ -42,9 +42,9 @@ component {
 	 * on drift.
 	 */
 	variables.engineSha256 = {};
-	variables.engineSha256["rustcfml-linux-aarch64"] = "95c74453632ab3da99b06e24b36539b3af642cdc29b60e38ebe4fe60a356d523";
-	variables.engineSha256["rustcfml-linux-x86_64"] = "cb053823ddbebf5d130e5a0eaf564a2148d0d93c6781f253e4cd52e8a7bd75fb";
-	variables.engineSha256["rustcfml-macos-aarch64"] = "890a970d31a49d98c779722aad86ac8846fdaad10901edb74078e814c495e333";
+	variables.engineSha256["rustcfml-linux-aarch64"] = "d62ae0eef23225cf3a1c359f2a463cb7c8f89d6f46f70b2f5a3db27ffbfcc0b5";
+	variables.engineSha256["rustcfml-linux-x86_64"] = "03e75bba1160115fffbcbb65e3312174264908b109aa75a6ec8cc3a1f371be3b";
+	variables.engineSha256["rustcfml-macos-aarch64"] = "a7c28aa66ca0ce3df603d06d5841605d6480ea70a63744339fda6da68f470f02";
 
 	variables.wheelsHome = "";
 
@@ -66,6 +66,17 @@ component {
 	// -------------------------------------------------------------------------
 	// Public lifecycle
 	// -------------------------------------------------------------------------
+
+	/** True when the pinned binary is already on disk and matches its sha256. */
+	public boolean function isInstalled() {
+		var binPath = variables.wheelsHome & "/rustcfml/bin/rustcfml-" & variables.engineVersion;
+		if (!fileExists(binPath)) {
+			return false;
+		}
+		// assetName() throws Wheels.RustCFML.UnsupportedPlatform: let it reach
+		// the caller's platform report instead of announcing a download.
+		return $sha256File(binPath) == $expectedSha256(assetName());
+	}
 
 	/**
 	 * Download (if needed) and cache the RustCFML binary for this platform.
@@ -513,9 +524,18 @@ component {
 		return $runSync(["kill", "-0", pidStr]) == 0;
 	}
 
+	/**
+	 * The LuCLI home this engine keeps its binaries and state under. The
+	 * -Dlucli.home system property outranks $LUCLI_HOME, as in
+	 * Module.$resolveLucliHome() (#3733): reading only the env var put the
+	 * state in ~/.wheels under a launcher that passes the property, so
+	 * `engines rustcfml status` missed a running server (#3913).
+	 */
 	private string function $resolveWheelsHome() {
 		try {
 			var sys = createObject("java", "java.lang.System");
+			var homeProp = sys.getProperty("lucli.home");
+			if (!isNull(homeProp) && len(trim(homeProp))) return homeProp;
 			var home = sys.getenv("LUCLI_HOME");
 			if (isNull(home) || !len(trim(home))) {
 				home = sys.getProperty("user.home") & "/.wheels";

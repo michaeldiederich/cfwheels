@@ -41,7 +41,7 @@ permissions:
 jobs:
   smoke:
     name: "Smoke: ${{ matrix.wheels_env }} (Lucee 7)"
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -75,7 +75,7 @@ jobs:
 
       - name: Run smoke probes
         run: |
-          BASE_URL="http://localhost:60007" SMOKE_ENV="${{ matrix.wheels_env }}" bash tools/ci/smoke-env.sh
+          BASE_URL="http://localhost:30007" SMOKE_ENV="${{ matrix.wheels_env }}" bash tools/ci/smoke-env.sh
 
       - name: Debug server logs
         if: failure()
@@ -100,7 +100,7 @@ jobs:
   # tools/docker/adobe2023/lib/) so nothing depends on an absent DB server.
   smoke-adobe:
     name: "Smoke: ${{ matrix.wheels_env }} (Adobe 2023)"
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     strategy:
       fail-fast: false

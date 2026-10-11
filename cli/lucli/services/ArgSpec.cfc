@@ -35,6 +35,10 @@ component {
 	public any function init() {
 		variables.positionals = [];
 		variables.named = {};
+		// Declaration order of the named options: variables.named is a struct,
+		// whose iteration order on Lucee is not insertion order, and help lists
+		// options in the order the command declares them.
+		variables.namedOrder = [];
 		// Keys parse() accepts without declaring or advertising them. `offline`
 		// is the one documented GLOBAL flag ("applies to every command",
 		// command-line-tools guide); commands that act on it read it through
@@ -77,6 +81,7 @@ component {
 		boolean default = false,
 		string description = ""
 	) {
+		$rememberOrder(arguments.name);
 		variables.named[arguments.name] = {
 			"default" = arguments.default,
 			"type" = "boolean",
@@ -99,6 +104,7 @@ component {
 		string description = "",
 		string choices = ""
 	) {
+		$rememberOrder(arguments.name);
 		variables.named[arguments.name] = {
 			"default" = arguments.default,
 			"type" = arguments.type,
@@ -148,6 +154,13 @@ component {
 	 */
 	public struct function parse(required struct coll, boolean strict = true) {
 		var result = {};
+
+		// LuCLI's runtime-owned MCP marker (wheels-dev/LuCLI#17) is never a
+		// command argument; Module.structuredArgs() normally removes it first.
+		if (structKeyExists(arguments.coll, "__lucliMcpCall")) {
+			arguments.coll = structCopy(arguments.coll);
+			structDelete(arguments.coll, "__lucliMcpCall");
+		}
 
 		// 1. Seed named defaults so every declared option is present in the result.
 		for (var optName in variables.named) {
@@ -271,6 +284,80 @@ component {
 	}
 
 	/**
+	 * Re-binds space-form option values (`--port 8931`). LuCLI hands that over
+	 * as port="true" plus a positional one index past the gap the flag left
+	 * (arg3 missing, arg4="8931"), so a value parser sees a bare flag.
+	 *
+	 * `matchers` maps each option that may arrive this way to a regex its
+	 * value must match ("" matches anything). The candidates are the
+	 * positionals that directly follow a gap. With one bare option and one
+	 * candidate, the candidate binds when it matches. With several, each
+	 * candidate must match exactly one bare option and each bare option
+	 * exactly one candidate (e.g. a number for port, a name for engine);
+	 * otherwise nothing is bound. Bound candidates leave the positionals.
+	 */
+	public struct function bindSpaceFormValues(required struct coll, required struct matchers) {
+		var bare = [];
+		for (var key in arguments.matchers) {
+			if (
+				structKeyExists(arguments.coll, key)
+				&& isSimpleValue(arguments.coll[key])
+				&& compareNoCase(trim(toString(arguments.coll[key])), "true") == 0
+			) {
+				arrayAppend(bare, key);
+			}
+		}
+		if (!arrayLen(bare)) {
+			return arguments.coll;
+		}
+		var maxIndex = 0;
+		for (var k in arguments.coll) {
+			if (reFindNoCase("^arg\d+$", k)) {
+				maxIndex = max(maxIndex, val(mid(k, 4, len(k) - 3)));
+			}
+		}
+		var candidates = [];
+		for (var i = 1; i < maxIndex; i++) {
+			if (!structKeyExists(arguments.coll, "arg" & i) && structKeyExists(arguments.coll, "arg" & (i + 1))) {
+				arrayAppend(candidates, "arg" & (i + 1));
+			}
+		}
+		if (arrayLen(candidates) != arrayLen(bare)) {
+			return arguments.coll;
+		}
+		var binding = {};
+		for (var argKey in candidates) {
+			var value = toString(arguments.coll[argKey]);
+			var owners = [];
+			for (var key in bare) {
+				var pattern = arguments.matchers[key];
+				if (!len(pattern) || reFind(pattern, value)) {
+					arrayAppend(owners, key);
+				}
+			}
+			// A single bare option takes the single candidate if it fits;
+			// several need a one-to-one match by value shape.
+			if (arrayLen(owners) != 1 || structKeyExists(binding, owners[1])) {
+				return arguments.coll;
+			}
+			binding[owners[1]] = argKey;
+		}
+		var result = duplicate(arguments.coll);
+		for (var key in binding) {
+			result[key] = result[binding[key]];
+			structDelete(result, binding[key]);
+		}
+		return result;
+	}
+
+	/** bindSpaceFormValues() for one option whose value can be anything. */
+	public struct function bindSpaceFormValue(required struct coll, required string key) {
+		var matchers = {};
+		matchers[arguments.key] = "";
+		return bindSpaceFormValues(arguments.coll, matchers);
+	}
+
+	/**
 	 * Reconstruct LuCLI's ordered argv from a structured argCollection.
 	 *
 	 * The inverse of LuCLI's parse: positionals (arg1, arg2, ...) emit first
@@ -310,7 +397,8 @@ component {
 		// argCollections may carry native booleans, which toString() renders
 		// as "true"/"false" — both shapes match the exact compare.
 		for (var key in arguments.coll) {
-			if (reFindNoCase("^arg\d+$", key)) {
+			// The runtime-owned MCP marker is never forwarded as a flag (#3980).
+			if (reFindNoCase("^arg\d+$", key) || compareNoCase(key, "__lucliMcpCall") == 0) {
 				continue;
 			}
 			if (isNull(arguments.coll[key])) {
@@ -323,7 +411,16 @@ component {
 				continue;
 			}
 			var stringValue = toString(value);
-			if (compareNoCase(stringValue, "true") == 0) {
+			// A key containing ":" is not a flag — it is a generator property token
+			// (`name:type`) that LuCLI parsed as a key=value pair because it carried
+			// a "=value" default (e.g. `status:string=active`, `active:boolean=false`).
+			// Re-emit it verbatim as `key=value` so the default survives: the generic
+			// true/false -> --key/--no-key conversion below would otherwise turn
+			// `active:boolean=false` into `--no-active:boolean` and drop the default.
+			// No command names a real flag with a ":".
+			if (find(":", key)) {
+				arrayAppend(result, key & "=" & stringValue);
+			} else if (compareNoCase(stringValue, "true") == 0) {
 				arrayAppend(result, "--" & key);
 			} else if (compareNoCase(stringValue, "false") == 0) {
 				arrayAppend(result, "--no-" & key);
@@ -333,6 +430,82 @@ component {
 		}
 
 		return result;
+	}
+
+	/**
+	 * The options section of `wheels <cmd> --help` (issue 3962): one entry per
+	 * positional and named option, in declaration order, with its description,
+	 * accepted values and default, wrapped to `width` columns. Keys added with
+	 * accept() are not listed, as they are not in the MCP schema either.
+	 */
+	public array function toHelpLines(numeric width = 100) {
+		var entries = [];
+		for (var p in variables.positionals) {
+			arrayAppend(entries, {label = "<" & p.name & ">", text = $helpText(p.description, p.choices, p["default"], p.type)});
+		}
+		for (var optName in variables.namedOrder) {
+			var spec = variables.named[optName];
+			var label = "--" & optName & "=<value>";
+			var text = $helpText(spec.description, spec.choices, spec["default"], spec.type);
+			if (spec.type == "boolean") {
+				var onByDefault = isBoolean(spec["default"]) && spec["default"];
+				label = onByDefault ? "--[no-]" & optName : "--" & optName;
+				if (onByDefault) {
+					text &= (len(text) ? " " : "") & "(on by default)";
+				}
+			}
+			arrayAppend(entries, {label = label, text = text});
+		}
+		var labelWidth = 0;
+		for (var entry in entries) {
+			labelWidth = max(labelWidth, len(entry.label));
+		}
+		labelWidth = min(labelWidth, 26);
+		var indent = 2 + labelWidth + 2;
+		var lines = [];
+		for (var entry in entries) {
+			var head = "  " & entry.label;
+			var words = listToArray(entry.text, " ");
+			var current = len(head) >= indent ? head : head & repeatString(" ", indent - len(head));
+			if (len(head) >= indent) {
+				arrayAppend(lines, head);
+				current = repeatString(" ", indent);
+			}
+			var fresh = true;
+			for (var word in words) {
+				if (!fresh && len(current) + 1 + len(word) > arguments.width) {
+					arrayAppend(lines, current);
+					current = repeatString(" ", indent) & word;
+				} else {
+					current &= (fresh ? "" : " ") & word;
+				}
+				fresh = false;
+			}
+			arrayAppend(lines, reReplace(current, "\s+$", ""));
+		}
+		return lines;
+	}
+
+	private string function $helpText(
+		required string description,
+		required array choices,
+		required any default,
+		required string type
+	) {
+		var text = trim(arguments.description);
+		if (arrayLen(arguments.choices)) {
+			text &= (len(text) ? " " : "") & "[" & arrayToList(arguments.choices, ", ") & "]";
+		}
+		if (arguments.type != "boolean" && isSimpleValue(arguments.default) && len(trim(toString(arguments.default)))) {
+			text &= (len(text) ? " " : "") & "(default: " & toString(arguments.default) & ")";
+		}
+		return text;
+	}
+
+	private void function $rememberOrder(required string name) {
+		if (!arrayFindNoCase(variables.namedOrder, arguments.name)) {
+			arrayAppend(variables.namedOrder, arguments.name);
+		}
 	}
 
 	/**

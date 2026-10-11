@@ -34,14 +34,22 @@ component extends="wheels.WheelsTest" {
 				// current value, not the final iteration's value.
 				(function(relPath) {
 					it("references " & canonical & " in " & relPath, () => {
+						// Framework files ship in every app; the CLI source only in the repo.
+						if (Left(relPath, 7) != "vendor/") {
+							$requireRepoPath(relPath);
+						}
 						var absolute = repoRoot & "/" & relPath;
 						expect(fileExists(absolute)).toBeTrue("Missing file: " & absolute);
 
 						var content = fileRead(absolute);
 
-						expect(content contains canonical).toBeTrue(
+						// Framework files build the link from the running version
+						// (wheels.GuidesLink, #3931); the frozen CommandBox CLI keeps the literal.
+						var linked = content contains canonical
+							|| content contains 'GuidesLink().link("command-line-tools/mcp-integration")';
+						expect(linked).toBeTrue(
 							relPath & " should reference " & canonical
-							& " — the URL ##2888 standardized on for the deprecated /wheels/mcp transport."
+							& " (or build it with wheels.GuidesLink) — the guide ##2888 standardized on for the deprecated /wheels/mcp transport."
 						);
 
 						expect(content contains phantomPath).toBeFalse(

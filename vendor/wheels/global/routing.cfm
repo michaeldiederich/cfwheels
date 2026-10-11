@@ -262,21 +262,14 @@
 			local.rv = local.base.protocol & "://" & local.rv;
 		} else if (
 			request.cgi.server_port_secure == "true"
-			|| request.cgi.http_x_forwarded_proto == "https"
+			|| ($trustProxyHeaders() && request.cgi.http_x_forwarded_proto == "https")
 		) {
 			// The real socket TLS state (server_port_secure) always wins. The
-			// X-Forwarded-Proto header is client-controlled: it still sets the
-			// scheme today so an app behind a TLS-terminating proxy keeps its
-			// https:// URLs, but when it is the ONLY reason and the app has not
-			// opted in with set(trustProxyHeaders=true), warn once that 4.2 will
-			// require the opt-in — the same gate isSecure() already applies.
-			if (
-				request.cgi.server_port_secure != "true"
-				&& request.cgi.http_x_forwarded_proto == "https"
-				&& !$trustProxyHeaders()
-			) {
-				$warnUntrustedForwardedProtoOnce();
-			}
+			// X-Forwarded-Proto header is client-controlled, so since 4.2 it only
+			// selects https:// when the app has opted in with
+			// set(trustProxyHeaders=true) — the same gate isSecure() applies.
+			// Without the opt-in a spoofed header can no longer induce https://
+			// absolute URLs (#3836).
 			local.rv = "https://" & local.rv;
 		} else {
 			local.rv = "http://" & local.rv;
@@ -428,33 +421,6 @@
 	}
 
 	/**
-	 * Internal. Logs a one-time warning when an absolute URL's scheme was taken
-	 * from an untrusted `X-Forwarded-Proto` header (the app has not set
-	 * `trustProxyHeaders=true` and the request is not really on TLS). The header
-	 * still sets the scheme today so proxied apps keep their https:// URLs, but
-	 * Wheels 4.2 will require the opt-in, matching `isSecure()`.
-	 */
-	public void function $warnUntrustedForwardedProtoOnce() {
-		if (!StructKeyExists(application, "wheels") || StructKeyExists(application.wheels, "$forwardedProtoTrustWarned")) {
-			return;
-		}
-		cflock(name = "wheels.forwardedProtoTrust.#application.applicationName#", type = "exclusive", timeout = 5) {
-			if (!StructKeyExists(application.wheels, "$forwardedProtoTrustWarned")) {
-				application.wheels.$forwardedProtoTrustWarned = true;
-				cflog(
-					type = "warning",
-					file = "wheels",
-					text = "An absolute URL's https scheme was taken from the X-Forwarded-Proto header, but "
-						& "trustProxyHeaders is not enabled. The header is client-controlled; set "
-						& "set(trustProxyHeaders=true) if this app sits behind a trusted TLS-terminating proxy. "
-						& "Wheels 4.2 will require the opt-in and otherwise ignore the header for the URL scheme."
-				);
-			}
-		}
-	}
-
-
-	/**
 	 * Internal function.
 	 */
 	public void function $loadRoutes() {
@@ -473,6 +439,14 @@
 		StructClear(application[local.appKey].namedRoutePositions);
 		if (StructKeyExists(application[local.appKey], "staticRoutes")) {
 			StructClear(application[local.appKey].staticRoutes);
+		}
+		// And Dispatch's route index (#4157): drop it, and move the generation on so
+		// an index built from the previous table can never be reused.
+		StructDelete(application[local.appKey], "dynamicRouteIndex");
+		if (StructKeyExists(application[local.appKey], "routeTableGeneration")) {
+			application[local.appKey].routeTableGeneration++;
+		} else {
+			application[local.appKey].routeTableGeneration = 1;
 		}
 		// Drop the URLFor controller/action memo so cached lookups from the
 		// previous route set (including negative-cached misses) can't leak
@@ -654,11 +628,21 @@
 				}
 			}
 
+			// The placeholder for this property is the literal `[prop]` or, for a wildcard
+			// segment, `[*prop]`. Locating and substituting it with literal Find/Replace avoids
+			// a regex per variable (the hot spot on every engine, #4151). Property names are
+			// alphanumeric route tokens with no regex metacharacters, so literal matching is
+			// equivalent to the `\[\*?prop\]` pattern.
+			local.lit = "[" & local.property & "]";
+			local.litStar = "[*" & local.property & "]";
+			local.posLit = Find(local.lit, local.rv);
+			local.posStar = Find(local.litStar, local.rv);
+
 			// If property is not in pattern, store it in the params argument.
 			// `$constructParams` encodes params itself, so append the raw value (escaping only the
 			// `&` / `=` delimiters it splits on, as the `params` argument documents) to avoid
 			// double-encoding, e.g. a space becoming `%2B` when URL rewriting is off.
-			if (!ReFind(local.reg, local.rv)) {
+			if (!local.posLit && !local.posStar) {
 				if (!ListFindNoCase(arguments.coreVariables, local.property)) {
 					if (arguments.args.encode && $get("encodeURLs")) {
 						local.rawValue = Replace(Replace(local.rawValue, "&", "%26", "all"), "=", "%3D", "all");
@@ -674,7 +658,18 @@
 			} else if (application.wheels.obfuscateUrls) {
 				local.value = obfuscateParam(local.value);
 			}
-			local.rv = ReReplace(local.rv, local.reg, local.value);
+			// A value containing a backslash or `$` is a regex-replacement metacharacter to
+			// ReReplace (which has no capture groups here, so its behaviour is engine-specific);
+			// keep ReReplace for those to stay byte-identical. Otherwise substitute the first
+			// matching literal placeholder (Replace is first-occurrence, matching ReReplace's
+			// one scope) — replacing whichever of `[prop]` / `[*prop]` appears first.
+			if (Find("\", local.value) || Find("$", local.value)) {
+				local.rv = ReReplace(local.rv, local.reg, local.value);
+			} else if (local.posStar && (!local.posLit || local.posStar < local.posLit)) {
+				local.rv = Replace(local.rv, local.litStar, local.value);
+			} else {
+				local.rv = Replace(local.rv, local.lit, local.value);
+			}
 		}
 		return local.rv;
 	}
@@ -711,9 +706,19 @@
 		numeric port,
 		boolean encode,
 		boolean $encodeForHtmlAttribute = false,
-		string $URLRewriting = application.wheels.URLRewriting
+		string $URLRewriting = application.wheels.URLRewriting,
+		boolean $argsResolved = false
 	) {
-		$args(name = "URLFor", args = arguments);
+		// An internal caller (e.g. linkTo) that has already run its own $args passes
+		// $argsResolved=true so we skip the redundant generic normalisation. We still apply any
+		// app-level `set(functionName="URLFor", …)` defaults here, since those belong to URLFor's
+		// default set (not the caller's) and would otherwise not reach the URL (#4151). Declaring
+		// $argsResolved as a real argument keeps the sentinel out of the generated query string.
+		if (!arguments.$argsResolved) {
+			$args(name = "URLFor", args = arguments);
+		} else if (StructKeyExists(application.wheels.functions, "URLFor")) {
+			$engineAdapter().structAppendDefaults(arguments, application.wheels.functions.URLFor);
+		}
 		local.coreVariables = "controller,action,key,format";
 		local.params = {};
 		if (StructKeyExists(variables, "params")) {

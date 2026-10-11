@@ -21,7 +21,7 @@
 	 * @cache If you want to cache the query, you can do so by specifying the number of minutes you want to cache the query for here. If you set it to `true`, the default cache time will be used (60 minutes).
 	 * @reload Set to `true` to force Wheels to query the database even though an identical query for this model may have been run in the same request. (The default in Wheels is to get the second query from the model's request-level cache.)
 	 * @parameterize Set to `true` to use `cfqueryparam` on all columns, or pass in a list of property names to use `cfqueryparam` on those only.
-	 * @returnAs Set to `objects` to return an array of objects, set to `structs` to return an array of structs, set to `query` to return a query result set, or set to 'sql' to return the executed SQL query as a string.
+	 * @returnAs Set to `objects` to return an array of objects, set to `structs` (or its alias `array`) to return an array of structs, set to `query` to return a query result set, or set to 'sql' to return the executed SQL query as a string.
 	 * @returnIncluded When `returnAs` is set to `objects`, you can set this argument to `false` to prevent returning objects fetched from associations specified in the `include` argument. This is useful when you only need to include associations for use in the `WHERE` clause only and want to avoid the performance hit that comes with object creation.
 	 * @callbacks Set to `false` to disable callbacks for this method.
 	 * @includeSoftDeletes Set to `true` to include soft-deleted records in the queries that this method runs.
@@ -233,7 +233,8 @@
 		} else if (!StructKeyExists(local, "rv")) {
 			// make the where clause generic for use in caching
 			local.originalWhere = arguments.where;
-			arguments.where = ReReplace(arguments.where, variables.wheels.class.RESQLWhere, "\1?\8", "all");
+			// computed on the masked string: RESQLWhere's values are masked literals
+			arguments.where = ReReplace($maskWhereLiterals(arguments.where), variables.wheels.class.RESQLWhere, "\1?\8", "all");
 
 			// get info from cache when available, otherwise create the generic select, from, where and order by clause.
 			// $useRequestCache governs request-level caching only — it doesn't change the generated SQL — so strip it from the shell-key args; otherwise the application-scoped SQL cache fragments into two entries (batch vs non-batch) for every model that uses both.
@@ -449,8 +450,10 @@
 			return false;
 		}
 
-		// Convert primary key column name(s) / value(s) to a WHERE clause.
-		arguments.where = $keyWhereString(values = arguments.key);
+		// Convert primary key column name(s) / value(s) to a WHERE clause that
+		// narrows any incoming `where` (a scope chain, a query builder or a
+		// direct argument) rather than replacing it.
+		arguments.where = $keyWhereWithScope(key = arguments.key, where = StructKeyExists(arguments, "where") ? arguments.where : "");
 		StructDelete(arguments, "key");
 
 		return findOne(argumentCollection = arguments);
@@ -516,6 +519,9 @@
 		if (IsArray(local.rv) && arguments.returnAs != 'array') {
 			if (ArrayLen(local.rv)) {
 				local.rv = local.rv[1];
+			} else if (ListFindNoCase("struct,structs", arguments.returnAs)) {
+				// No match returns an empty struct for returnAs="struct", as it always has.
+				local.rv = {};
 			} else {
 				local.rv = false;
 			}
@@ -557,6 +563,9 @@
 	 * @property [see:findFirst].
 	 */
 	public any function findLastOne(string property) {
+		if ($strictArgumentsMode() != "off") {
+			$checkArguments(args = arguments, name = "findLastOne", accepted = $strictArgumentsAccepted("findLastOne"));
+		}
 		arguments.$sort = "DESC";
 		return findFirst(argumentCollection = arguments);
 	}
@@ -607,7 +616,23 @@
 	 * [category: Miscellaneous Functions]
 	 */
 	public void function reload() {
-		local.query = findByKey(key = key(), reload = true, returnAs = "query");
+		// A reloaded object reports no saved changes, as after clearChangeInformation() (F49).
+		StructDelete(variables, "$savedChanges");
+		// An object without a key has no row to read back: an unsaved object, or a save on a
+		// database that returns no generated key (Oracle). Leave it as it is.
+		if (!Len(key())) {
+			return;
+		}
+		// The row as it is now, soft-deleted or not; a row that is gone can't be reloaded. A finder
+		// can answer false instead of an empty query (BoxLang), which also means no row.
+		local.query = findByKey(key = key(), reload = true, returnAs = "query", includeSoftDeletes = true);
+		if (!IsQuery(local.query) || !local.query.recordCount) {
+			Throw(
+				type = "Wheels.RecordNotFound",
+				message = "Can't reload this #variables.wheels.class.modelName# object: no row exists for its key (#key()#).",
+				extendedInfo = "The row was deleted after the object was loaded."
+			);
+		}
 		local.properties = propertyNames();
 		local.columnInfo = variables.wheels.class.properties;
 		local.iEnd = ListLen(local.properties);

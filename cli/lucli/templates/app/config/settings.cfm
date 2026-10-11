@@ -3,14 +3,15 @@
 		Use this file to configure your application.
 		You can also use the environment specific files (e.g. /config/production/settings.cfm) to override settings set here.
 		Don't forget to issue a reload request (e.g. reload=true) after making changes.
-		See https://guides.wheels.dev/v4-0-0/core-concepts/environments-and-configuration/ for more info.
+		See https://guides.wheels.dev/v4-2-0/core-concepts/environments-and-configuration/ for more info.
 	*/
 
 	/*
-		Set data source name. By default uses the app name.
+		Set data source name: WHEELS_DATASOURCE from .env or the process
+		environment, otherwise the app name.
 		Uncomment username/password if your datasource requires them.
 	*/
-	set(dataSourceName="{{datasourceName}}");
+	set(dataSourceName=env("WHEELS_DATASOURCE", "{{datasourceName}}"));
 	// set(dataSourceUserName="");
 	// set(dataSourcePassword="");
 
@@ -60,6 +61,18 @@
 		functionName="textField,textArea,passwordField,select,fileField,emailField,urlField,numberField,telField,dateField,searchField,colorField,rangeField",
 		labelPlacement="before"
 	);
+
+	/*
+		App tests (/wheels/app/tests, `wheels test`) default to the
+		`<datasource>_test` database and refuse to run if it is absent, so test
+		writes never reach your real database. A default SQLite app
+		already has a `<name>_test` datasource. If your app deliberately has no
+		separate test database, uncomment the line below: an omitted useTestDB
+		(e.g. an older CLI) then runs tests against the primary datasource with a
+		warning instead of being refused. `wheels test --no-test-db` and an
+		explicit useTestDB=true are unaffected by this setting.
+	*/
+	// set(allowTestsAgainstPrimaryDatasource=true);
 
 	// CLI-Appends-Here
 </cfscript>

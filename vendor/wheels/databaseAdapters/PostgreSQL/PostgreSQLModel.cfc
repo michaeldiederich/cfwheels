@@ -1,5 +1,14 @@
 component extends="wheels.databaseAdapters.Base" output=false {
 
+	/**
+	 * Internal function. PostgreSQL (and CockroachDB, which extends this adapter) take a
+	 * high-precision decimal exactly as cf_sql_other, which the driver passes untyped for the
+	 * server to parse; a varchar bind is rejected against a numeric column (#4172).
+	 */
+	public string function $wideDecimalBindType() {
+		return "cf_sql_other";
+	}
+
 	variables.postgresTypeMap = {
 		"bigint": "cf_sql_bigint",
 		"int8": "cf_sql_bigint",
@@ -45,7 +54,8 @@ component extends="wheels.databaseAdapters.Base" output=false {
 		"varchar": "cf_sql_varchar",
 		"varying": "cf_sql_varchar",
 		"bpchar": "cf_sql_varchar",
-		"uuid": "cf_sql_varchar",
+		// The driver rejects a varchar bind against a uuid column; OTHER lets it infer the type (#4094).
+		"uuid": "cf_sql_other",
 		"macaddr": "cf_sql_varchar",
 		"macaddr8": "cf_sql_varchar",
 		"point": "cf_sql_other",
@@ -171,16 +181,24 @@ component extends="wheels.databaseAdapters.Base" output=false {
 	 * forever).
 	 */
 	public void function $acquireAdvisoryLock(required string name, numeric timeout = 10) {
+		$acquireAdvisoryLockSession(name = arguments.name, timeout = arguments.timeout);
+	}
+
+	/**
+	 * Internal function. Acquires the lock as $acquireAdvisoryLock() does and returns the holding
+	 * backend's pid, read in the same statement so it is the session that took the lock (#4197).
+	 */
+	public string function $acquireAdvisoryLockSession(required string name, numeric timeout = 10) {
 		local.startedAt = GetTickCount();
 		local.timeoutMs = arguments.timeout * 1000;
 		while (true) {
 			local.result = queryExecute(
-				"SELECT pg_try_advisory_lock(hashtext(?)) AS lockresult",
+				"SELECT pg_try_advisory_lock(hashtext(?)) AS lockresult, pg_backend_pid() AS sessionid",
 				[arguments.name],
-				{datasource: variables.dataSource, username: variables.username, password: variables.password}
+				$advisoryLockConnection()
 			);
 			if (IsQuery(local.result) && IsBoolean(local.result.lockresult) && local.result.lockresult) {
-				return;
+				return local.result.sessionid;
 			}
 			if (GetTickCount() - local.startedAt >= local.timeoutMs) {
 				Throw(
@@ -200,8 +218,45 @@ component extends="wheels.databaseAdapters.Base" output=false {
 		queryExecute(
 			"SELECT pg_advisory_unlock(hashtext(?))",
 			[arguments.name],
-			{datasource: variables.dataSource, username: variables.username, password: variables.password}
+			$advisoryLockConnection()
 		);
+	}
+
+	/**
+	 * Internal function. pg_advisory_unlock returns true only on the session holding the lock (#4197).
+	 */
+	public boolean function $tryReleaseAdvisoryLock(required string name) {
+		local.result = queryExecute(
+			"SELECT pg_advisory_unlock(hashtext(?)) AS released",
+			[arguments.name],
+			$advisoryLockConnection()
+		);
+		return IsQuery(local.result) && IsBoolean(local.result.released) && local.result.released;
+	}
+
+	/**
+	 * Internal function. True while the backend `holder` holds the lock, or any session in this
+	 * database when no session is given (#4197). The key is
+	 * hashtext(name) as a bigint, which pg_locks splits into classid (high 32 bits) and objid (low).
+	 * CAST, not `::`: Lucee reads `:name` in queryExecute SQL as a named parameter.
+	 */
+	public boolean function $isAdvisoryLockHeld(required string name, string holder = "") {
+		local.sql = "SELECT COUNT(*) AS holders FROM pg_locks WHERE locktype = 'advisory' AND granted"
+			& " AND database = (SELECT oid FROM pg_database WHERE datname = current_database())"
+			& " AND classid = CAST(((CAST(hashtext(?) AS bigint) >> 32) & 4294967295) AS oid)"
+			& " AND objid = CAST((CAST(hashtext(?) AS bigint) & 4294967295) AS oid)"
+			& " AND objsubid = 1";
+		local.params = [arguments.name, arguments.name];
+		if (Len(arguments.holder)) {
+			local.sql &= " AND pid = ?";
+			ArrayAppend(local.params, {value = arguments.holder, cfsqltype = "cf_sql_integer"});
+		}
+		local.result = queryExecute(
+			local.sql,
+			local.params,
+			$advisoryLockConnection()
+		);
+		return IsQuery(local.result) && Val(local.result.holders) > 0;
 	}
 
 	/**
@@ -210,6 +265,45 @@ component extends="wheels.databaseAdapters.Base" output=false {
 	 */
 	public boolean function $supportsAdvisoryLocks() {
 		return true;
+	}
+
+	/**
+	 * PostgreSQL supports transaction-scoped advisory locks via pg_advisory_xact_lock, which
+	 * auto-releases at transaction commit or rollback (#4198).
+	 */
+	public boolean function $supportsTransactionalAdvisoryLock() {
+		return true;
+	}
+
+	/**
+	 * Internal function. Acquires a PostgreSQL transaction-scoped advisory lock on the current
+	 * (pinned) connection by polling pg_try_advisory_xact_lock until the timeout expires (#4198).
+	 * The blocking pg_advisory_xact_lock would ignore the timeout, so the try form is polled, exactly
+	 * as the session-scoped acquire does. The lock auto-releases when the enclosing transaction ends,
+	 * so there is no release step. The query never raises on contention (pg_try_* returns a boolean),
+	 * which matters here: a statement error inside the transaction would abort the whole transaction.
+	 */
+	public void function $acquireAdvisoryLockTransactional(required string name, numeric timeout = 10) {
+		local.startedAt = GetTickCount();
+		local.timeoutMs = arguments.timeout * 1000;
+		while (true) {
+			local.result = queryExecute(
+				"SELECT pg_try_advisory_xact_lock(hashtext(?)) AS lockresult",
+				[arguments.name],
+				$advisoryLockConnection()
+			);
+			if (IsQuery(local.result) && IsBoolean(local.result.lockresult) && local.result.lockresult) {
+				return;
+			}
+			if (GetTickCount() - local.startedAt >= local.timeoutMs) {
+				Throw(
+					type = "Wheels.AdvisoryLockTimeout",
+					message = "Could not acquire advisory lock '#arguments.name#' within #arguments.timeout# seconds.",
+					extendedInfo = "The PostgreSQL pg_try_advisory_xact_lock function kept returning false, indicating another transaction holds the lock."
+				);
+			}
+			Sleep(250);
+		}
 	}
 
 	/**

@@ -15,7 +15,14 @@ component extends="Base" {
         return this;
     }
 
-    public string function run(required any role, required string version) {
+    /**
+     * @migrateOnBoot "true" for the one container that runs the migrations
+     *                (#4063). Any other container gets "false" whenever
+     *                deploy.yml has a `migrate:` block, so `app boot` and the
+     *                other hosts never migrate at start; without the block the
+     *                variable is not set at all.
+     */
+    public string function run(required any role, required string version, string migrateOnBoot = "") {
         return docker(
             "run",
             "--detach",
@@ -23,10 +30,23 @@ component extends="Base" {
             "--name " & shellEscape(container_name(arguments.role, arguments.version)),
             "--network kamal",
             $labelArgs(arguments.role, arguments.version),
+            $volumeArgs(),
             $envArgs(arguments.role),
+            $migrateEnvArgs(arguments.migrateOnBoot),
             shellEscape(variables.config.absoluteImage(arguments.version)),
             arguments.role.cmd()
         );
+    }
+
+    private array function $migrateEnvArgs(required string migrateOnBoot) {
+        var value = arguments.migrateOnBoot;
+        if (!len(value) && variables.config.migrate().enabled()) {
+            value = "false";
+        }
+        if (!len(value)) {
+            return [];
+        }
+        return ["-e", shellEscape("WHEELS_MIGRATE_ON_BOOT=" & value)];
     }
 
     /**
@@ -79,6 +99,13 @@ component extends="Base" {
                       shellEscape(container_name(arguments.role, arguments.version)));
     }
 
+    /** Every container of one role, any version (`app details` without --release). */
+    public string function role_containers(required any role) {
+        return docker("ps", "-a",
+                      "--filter", shellEscape("label=service=" & variables.config.service()),
+                      "--filter", shellEscape("label=role=" & arguments.role.name()));
+    }
+
     public string function containers() {
         return docker("ps", "--filter", shellEscape("label=service=" & variables.config.service()));
     }
@@ -87,14 +114,24 @@ component extends="Base" {
         return docker("images", variables.config.image());
     }
 
-    public string function logs(struct opts = {}) {
-        var parts = ["logs"];
-        var tail = arguments.opts.tail ?: 100;
-        arrayAppend(parts, "--tail");
-        arrayAppend(parts, tail);
+    /**
+     * Tail a container's logs. Without `container`, the role's newest running container (by the
+     * service / role / destination labels `run` stamps on) is piped in, as Kamal does; a bare
+     * `docker logs` without a container name is an error (#4416).
+     */
+    public string function logs(struct opts = {}, any role) {
+        var parts = ["logs", "--tail", arguments.opts.tail ?: 100];
         if (arguments.opts.follow ?: false) arrayAppend(parts, "--follow");
-        if (len(arguments.opts.container ?: "")) arrayAppend(parts, arguments.opts.container);
-        return docker(parts);
+        if (len(arguments.opts.container ?: "")) {
+            arrayAppend(parts, shellEscape(arguments.opts.container));
+            return docker(parts);
+        }
+        var filters = ["ps", "--latest", "--quiet", "--filter", shellEscape("label=service=" & variables.config.service())];
+        if (!isNull(arguments.role)) {
+            arrayAppend(filters, ["--filter", shellEscape("label=role=" & arguments.role.name())], true);
+            arrayAppend(filters, ["--filter", shellEscape("label=destination=" & variables.config.destination())], true);
+        }
+        return pipe([docker(filters), "xargs -r " & docker(parts)]);
     }
 
     public string function container_name(required any role, required string version) {
@@ -120,6 +157,16 @@ component extends="Base" {
             docker("stop", shellEscape(container_name(arguments.role, arguments.version))),
             docker("rm", shellEscape(container_name(arguments.role, arguments.version)))
         ]);
+    }
+
+    /** Top-level `volumes:`, quoted like every other docker argument (#4018). */
+    private array function $volumeArgs() {
+        var parts = [];
+        for (var v in variables.config.volumes()) {
+            arrayAppend(parts, "--volume");
+            arrayAppend(parts, shellEscape(v));
+        }
+        return parts;
     }
 
     private array function $labelArgs(required any role, required string version) {

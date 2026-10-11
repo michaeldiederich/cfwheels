@@ -48,15 +48,89 @@ component {
         var rolesMap = $roleHosts(cfg);
         // Same output path as every other deploy verb: config warnings first,
         // and any value resolved from .kamal/secrets redacted.
+        // Secret VALUES never appear: env.secret and registry.password list
+        // only the key names that .kamal/secrets supplies.
+        var accessories = {};
+        for (var acc in cfg.accessories()) {
+            accessories[acc.name()] = {
+                "image": acc.image(),
+                "hosts": acc.hosts(),
+                "port": acc.port(),
+                "volumes": acc.volumes()
+            };
+        }
+        var proxy = cfg.proxy();
+        var ssh = cfg.ssh();
+        var builder = cfg.builder();
         return new modules.wheels.services.deploy.lib.SecretRedaction().render(yaml.dump({
-            service: cfg.service(),
-            image: cfg.image(),
-            servers: rolesMap,
-            registry: {
-                server: cfg.registry().server(),
-                username: cfg.registry().username()
+            "service": cfg.service(),
+            "image": cfg.image(),
+            "servers": rolesMap,
+            "registry": {
+                "server": cfg.registry().server(),
+                "username": cfg.registry().username(),
+                "password": $registryPasswordKeys(cfg)
+            },
+            "proxy": {
+                "host": proxy.host(),
+                "ssl": proxy.ssl(),
+                "app_port": proxy.appPort(),
+                "healthcheck": proxy.healthcheck()
+            },
+            "env": {
+                "clear": cfg.env().clear(),
+                "secret": cfg.env().secret()
+            },
+            "volumes": cfg.volumes(),
+            "accessories": accessories,
+            "ssh": {
+                "user": ssh.user(),
+                "port": ssh.port()
+            },
+            "builder": {
+                "arch": builder.arch(),
+                "context": builder.context(),
+                "dockerfile": builder.dockerfile()
             }
         }));
+    }
+
+    /**
+     * registry.password as config() prints it. Entries are meant to be the
+     * NAMES of keys in .kamal/secrets (REGISTRY_PASSWORD). An entry is shown
+     * only when .kamal/secrets defines that key; anything else is probably
+     * the password itself (a ghp_… token or a plain password look like names
+     * too), so it is masked and a warning says to move it into a secret.
+     * Without a resolver, only a strict UPPER_SNAKE name that isn't shaped
+     * like a GitHub token is shown.
+     */
+    private array function $registryPasswordKeys(required any cfg) {
+        var shown = [];
+        var masked = false;
+        var resolver = variables.loader.secretResolver();
+        for (var entry in arguments.cfg.registry().password()) {
+            var isKey = false;
+            if (isSimpleValue(entry) && len(entry)) {
+                if (isObject(resolver)) {
+                    isKey = reFind("^[A-Za-z_][A-Za-z0-9_]*$", entry) && resolver.has(entry);
+                } else {
+                    isKey = reFind("^[A-Z_][A-Z0-9_]*$", entry) && !reFindNoCase("^(ghp|gho|ghu|ghs|ghr|github_pat)_", entry);
+                }
+            }
+            if (isKey) {
+                arrayAppend(shown, entry);
+            } else {
+                arrayAppend(shown, "<literal value hidden: use a secret>");
+                masked = true;
+            }
+        }
+        if (masked) {
+            new modules.wheels.services.deploy.lib.SecretRedaction().addWarning(
+                "registry.password lists a value that is not a key in .kamal/secrets; it is hidden here. "
+                & "List the NAME of a key in .kamal/secrets (e.g. REGISTRY_PASSWORD) and put the password there."
+            );
+        }
+        return shown;
     }
 
     public string function deploy(required struct opts) {
@@ -97,6 +171,10 @@ component {
         // Port the app listens on inside the container — the kamal-proxy
         // --target. Resolved from proxy.app_port (default 80); see #3089.
         var appPort = cfg.proxy().appPort();
+        // The one host that migrates the database (#4063), resolved before the
+        // lock so a bad migrate: block fails without stranding it. {} when
+        // deploy.yml has no migrate: block.
+        var migrateTarget = $migrateTarget(cfg);
 
         // env.secret delivery (#2957): render the env-file content ONCE,
         // before the lock or any remote call, so an unresolvable secret
@@ -152,8 +230,22 @@ component {
                     $dispatch(proxyHosts, proxy.start_or_run(), dryRun);
                 }
 
-                for (var role in cfg.roles()) {
-                    for (var host in role.hosts()) {
+                // Kamal's rolling boot (#3925): with a boot: block, each
+                // role's hosts boot in batches of boot.limit, boot.wait
+                // seconds apart. Without one, hosts boot back to back.
+                var bootConfigured = structKeyExists(cfg.raw(), "boot");
+                var boot = cfg.boot();
+                // With migrate: (#4063) the migrate host boots and cuts over
+                // first, so its health check gates every other host.
+                for (var role in $migrateOrderedRoles(cfg.roles(), migrateTarget)) {
+                    var roleHosts = $migrateOrderedHosts(role, migrateTarget);
+                    var batchSize = bootConfigured ? boot.batchSize(arrayLen(roleHosts)) : arrayLen(roleHosts);
+                    var hostNumber = 0;
+                    for (var host in roleHosts) {
+                        hostNumber++;
+                        if (bootConfigured && hostNumber > 1 && (hostNumber - 1) % batchSize == 0) {
+                            $bootPause(boot.wait(), dryRun, batchSize);
+                        }
                         // A same-version redeploy would hit a guaranteed
                         // docker run --name conflict otherwise (#2957 DEP-11a).
                         $dispatch([host], app.remove_conflicting(role, ver), dryRun);
@@ -168,15 +260,25 @@ component {
                                 dryRun
                             );
                         }
-                        $dispatch([host], app.run(role, ver), dryRun);
+                        var isMigrateHost = $isMigrateHost(role, host, migrateTarget);
+                        $dispatch([host], app.run(role, ver, isMigrateHost ? "true" : ""), dryRun);
                         // Only proxy-fronted roles register with kamal-proxy —
-                        // job/worker roles serve no traffic (#2957).
+                        // job/worker roles serve no traffic (#2957). On the
+                        // migrate host the health check also waits out the
+                        // migrations, and a failed one stops the deploy here.
                         if (role.runningProxy()) {
                             $dispatch(
                                 [host],
-                                proxy.deploy(role, app.container_name(role, ver) & ":" & appPort),
+                                proxy.deploy(
+                                    role,
+                                    app.container_name(role, ver) & ":" & appPort,
+                                    isMigrateHost ? cfg.migrate().timeout() : 0
+                                ),
                                 dryRun
                             );
+                        }
+                        if (isMigrateHost) {
+                            $dispatch(hosts, auditor.record("migrated the database on " & host & " for version " & ver), dryRun, true);
                         }
                         // Post-cutover cleanup: stop superseded versions
                         // (#2957 DEP-11a). Best-effort (allowFail) — a failed
@@ -226,6 +328,119 @@ component {
             "Deployed " & cfg.service() & " version " & ver
                 & " to " & arrayLen(hosts) & " host(s): " & arrayToList(hosts, ", ")
         );
+    }
+
+    /**
+     * The role and host that migrate the database (#4063), or {} when
+     * deploy.yml has no migrate: block. The default is the first host of the
+     * first role; migrate.host picks another. It must belong to a proxy-fronted
+     * role, because that role's health check is what stops a deploy whose
+     * migration failed before any host cuts over.
+     */
+    private struct function $migrateTarget(required any cfg) {
+        var migrate = arguments.cfg.migrate();
+        if (!migrate.enabled()) {
+            return {};
+        }
+        var roles = arguments.cfg.roles();
+        if (!$hasProxyRole(roles)) {
+            throw(
+                type = "DeployMainCli.InvalidMigrateConfig",
+                message = "migrate: needs a proxy-fronted role (web, or a role with proxy: true), because its health check is what stops a deploy whose migration failed. This deploy.yml has only job/worker roles, so remove migrate: and run the migrations yourself."
+            );
+        }
+        var wanted = migrate.host();
+        if (!len(wanted)) {
+            if (!roles[1].runningProxy()) {
+                throw(
+                    type = "DeployMainCli.InvalidMigrateConfig",
+                    message = "migrate: defaults to the first host of the first role ('#roles[1].name()#'), which is not proxy-fronted. Set migrate.host to a host of a proxy-fronted role."
+                );
+            }
+            return {role: roles[1].name(), host: roles[1].hosts()[1]};
+        }
+        var foundInRole = "";
+        for (var role in roles) {
+            for (var host in role.hosts()) {
+                if (compare(trim(host), wanted) == 0) {
+                    if (role.runningProxy()) {
+                        return {role: role.name(), host: host};
+                    }
+                    foundInRole = role.name();
+                }
+            }
+        }
+        throw(
+            type = "DeployMainCli.InvalidMigrateConfig",
+            message = len(foundInRole)
+                ? "migrate.host '#wanted#' is in the '#foundInRole#' role, which is not proxy-fronted. Pick a host of a proxy-fronted role."
+                : "migrate.host '#wanted#' is not a host of any role in servers:."
+        );
+    }
+
+    private boolean function $hasProxyRole(required array roles) {
+        for (var role in arguments.roles) {
+            if (role.runningProxy()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** The roles in deploy order: the migrate host's role first (#4063). */
+    private array function $migrateOrderedRoles(required array roles, required struct target) {
+        if (structIsEmpty(arguments.target)) {
+            return arguments.roles;
+        }
+        var first = [];
+        var rest = [];
+        for (var role in arguments.roles) {
+            if (role.name() == arguments.target.role) {
+                arrayAppend(first, role);
+            } else {
+                arrayAppend(rest, role);
+            }
+        }
+        arrayAppend(first, rest, true);
+        return first;
+    }
+
+    /** A role's hosts in deploy order: the migrate host first in its role (#4063). */
+    private array function $migrateOrderedHosts(required any role, required struct target) {
+        var hosts = arguments.role.hosts();
+        if (structIsEmpty(arguments.target) || arguments.role.name() != arguments.target.role) {
+            return hosts;
+        }
+        var ordered = [arguments.target.host];
+        for (var host in hosts) {
+            if (compare(host, arguments.target.host) != 0) {
+                arrayAppend(ordered, host);
+            }
+        }
+        return ordered;
+    }
+
+    private boolean function $isMigrateHost(required any role, required string host, required struct target) {
+        return !structIsEmpty(arguments.target)
+            && arguments.role.name() == arguments.target.role
+            && compare(arguments.host, arguments.target.host) == 0;
+    }
+
+    /**
+     * The boot.wait pause between two batches of hosts. A dry run records it
+     * instead of sleeping. Its own method so specs can stub the sleep.
+     */
+    private void function $bootPause(required numeric seconds, required boolean dryRun, required numeric batchSize) {
+        if (arguments.dryRun) {
+            arrayAppend(
+                variables.dryRunBuffer,
+                "[boot] wait " & arguments.seconds & "s before the next batch (boot.limit: " & arguments.batchSize & " host(s) per batch)"
+            );
+            return;
+        }
+        if (arguments.seconds > 0) {
+            sleep(arguments.seconds * 1000);
+        }
     }
 
     public string function redeploy(required struct opts) {
@@ -557,12 +772,34 @@ component {
             summary &= chr(10) & "WARNING: .kamal/secrets is already tracked by git, and .gitignore does not untrack it. "
                 & "Run git rm --cached .kamal/secrets, commit, and rotate every secret the file has ever held.";
         }
-        return summary & chr(10)
+        var steps = summary & chr(10)
              & "Next steps:" & chr(10)
              & "  1. Edit config/deploy.yml — update servers, proxy host, registry username." & chr(10)
              & "  2. Review the generated Dockerfile — adjust COPY paths and the Lucee/CFML base if your app needs it." & chr(10)
              & "  3. Populate .kamal/secrets with real values (or $(cmd) substitutions)." & chr(10)
              & "  4. wheels deploy setup";
+        if ($usesSqlite(cwd)) {
+            steps &= chr(10) & chr(10)
+                & "This app uses SQLite. The image ships an empty db/ (your local db/*.sqlite files stay out of it), "
+                & "so production starts with an empty database inside the container." & chr(10)
+                & "  - Keep it across redeploys by mounting db/ from the host in config/deploy.yml:" & chr(10)
+                & "      volumes:" & chr(10)
+                & "        - /var/lib/" & serviceName & "/db:/var/www/db" & chr(10)
+                & "    and create that directory on each host first: wheels deploy exec ""mkdir -p /var/lib/" & serviceName & "/db""" & chr(10)
+                & "  - Run migrations on boot: set(autoMigrateDatabase=true) in config/production/settings.cfm." & chr(10)
+                & "  - For a database shared across several hosts, use a server database: wheels deploy docs accessories.";
+        }
+        return steps;
+    }
+
+    /** True when config/app.cfm defines a SQLite datasource (the `wheels new` default). */
+    private boolean function $usesSqlite(required string cwd) {
+        var appCfm = arguments.cwd & "config/app.cfm";
+        try {
+            return fileExists(appCfm) && findNoCase("org.sqlite.JDBC", fileRead(appCfm)) > 0;
+        } catch (any e) {
+            return false;
+        }
     }
 
     /**

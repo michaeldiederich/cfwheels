@@ -45,6 +45,63 @@ component extends="wheels.migrator.Base"{
 	}
 
 	/**
+	 * Internal function. Throws Wheels.Migrator.UnsupportedColumnType for a column type this
+	 * migrator has no SQL type for (#4095), before any DDL runs. typeToSQL() would otherwise
+	 * return "" and the column would be emitted with no type: a DDL syntax error on most
+	 * databases, and on SQLite a typeless column whose model fails to load.
+	 */
+	public void function $assertColumnTypeSupported(required string type) {
+		if (IsDefined("variables.sqlTypes") && StructKeyExists(variables.sqlTypes, arguments.type)) {
+			return;
+		}
+		local.supported = IsDefined("variables.sqlTypes") ? ListSort(StructKeyList(variables.sqlTypes), "textnocase") : "";
+		Throw(
+			type = "Wheels.Migrator.UnsupportedColumnType",
+			message = "Column type `#arguments.type#` is not supported by the #adapterName()# migrator.",
+			extendedInfo = "Supported column types: #Replace(local.supported, ",", ", ", "all")#."
+		);
+	}
+
+	/**
+	 * Internal function. The SQL default expression that generates a UUID for a
+	 * uniqueidentifier column whose default is SQL Server's `newid()` (#4094). Each
+	 * adapter sets `variables.uuidDefaultSQL`; SQL Server keeps `newid()`. Returns ""
+	 * when the server is too old to generate one in a default, so the column is
+	 * created without a default instead of with DDL the server rejects.
+	 */
+	public string function $uuidDefaultSQL() {
+		if (StructKeyExists(variables, "uuidDefaultSupported") && !variables.uuidDefaultSupported) {
+			$warnUuidDefaultOmitted();
+			return "";
+		}
+		return StructKeyExists(variables, "uuidDefaultSQL") ? variables.uuidDefaultSQL : "newid()";
+	}
+
+	/**
+	 * Internal function. Set by Migration.init() from the server version.
+	 */
+	public void function $setUuidDefaultSupported(required boolean supported) {
+		variables.uuidDefaultSupported = arguments.supported;
+	}
+
+	/**
+	 * Internal function. One-time note that a uniqueidentifier column was created
+	 * without a database default, so the app must set its value.
+	 */
+	public void function $warnUuidDefaultOmitted() {
+		local.appKey = $appKey();
+		if (StructKeyExists(application[local.appKey], "$uuidDefaultOmittedWarned")) {
+			return;
+		}
+		application[local.appKey].$uuidDefaultOmittedWarned = true;
+		local.text = "This #adapterName()# server cannot generate a UUID in a column default "
+			& "(PostgreSQL 13+ and MySQL 8.0.13+ can), so uniqueidentifier columns are created "
+			& "without one. Set the value when you create a record, e.g. with generateUUID(). (##4094)";
+		announce(local.text);
+		cflog(type = "warning", file = "wheels", text = local.text);
+	}
+
+	/**
 	 * throw an exception for adapters without its own addPrimaryKeyOptions implementation
 	 */
 	public string function addPrimaryKeyOptions() {
@@ -73,13 +130,11 @@ component extends="wheels.migrator.Base"{
 		if (StructKeyExists(arguments.options, 'type') && arguments.options.type != 'primaryKey') {
 			if (StructKeyExists(arguments.options, 'default') && optionsIncludeDefault(argumentCollection = arguments.options)) {
 				$rejectEmptyStringDefault(arguments.options);
-				if (
-					arguments.options.default eq "NULL"
-					|| (
-						arguments.options.default eq ""
-						&& ListFindNoCase("boolean,date,datetime,time,timestamp,decimal,float,integer", arguments.options.type)
-					)
-				) {
+				if (arguments.options.default eq "" && !$emptyDefaultBecomesNull(arguments.options)) {
+					// No default given: a NOT NULL column gets no DEFAULT clause at all
+					// (MySQL rejects DEFAULT NULL NOT NULL), and nothing emits a bare
+					// DEFAULT or an empty literal for a type that is not string-like.
+				} else if (arguments.options.default eq "NULL" || arguments.options.default eq "") {
 					arguments.sql = arguments.sql & " DEFAULT NULL";
 				} else if (arguments.options.type == 'boolean') {
 					arguments.sql = arguments.sql & " DEFAULT #IIf(arguments.options.default, 1, 0)#";
@@ -104,6 +159,21 @@ component extends="wheels.migrator.Base"{
 	// what's the purpose of this?
 	public boolean function optionsIncludeDefault(string type, default = "", boolean allowNull = true) {
 		return true;
+	}
+
+	/**
+	 * An empty `default` on a column that is not string-like means "no default"
+	 * (`float()` itself defaults to `default=""`). It renders as DEFAULT NULL when the
+	 * column may hold null, and as no DEFAULT clause on a NOT NULL column, which MySQL
+	 * rejects as DEFAULT NULL NOT NULL. Never as a bare DEFAULT or an empty literal.
+	 * (string/text/char reject an empty default first: $rejectEmptyStringDefault.)
+	 */
+	public boolean function $emptyDefaultBecomesNull(required struct options) {
+		return !(
+			StructKeyExists(arguments.options, "allowNull")
+			&& IsBoolean(arguments.options.allowNull)
+			&& !arguments.options.allowNull
+		);
 	}
 
 	/**

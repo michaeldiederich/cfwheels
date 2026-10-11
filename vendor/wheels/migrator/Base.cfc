@@ -102,6 +102,100 @@ component extends="wheels.Global"{
 		return local.adapterName;
 	}
 
+	/**
+	 * True when the migrator's Oracle datasource is Oracle 23ai or later, which
+	 * has a native BOOLEAN type (#3897). Read from the server version once per
+	 * datasource and memoized like $getDBType. Any failure reads as "no" (the
+	 * NUMBER(1) DDL every Oracle release accepts).
+	 */
+	public boolean function $oracleSupportsNativeBoolean(string dataSource = "") {
+		local.appKey = $appKey();
+		local.dsName = Len(arguments.dataSource) ? arguments.dataSource : $migratorDataSource();
+		if (!StructKeyExists(application[local.appKey], "$oracleNativeBoolean")) {
+			application[local.appKey].$oracleNativeBoolean = {};
+		}
+		if (!StructKeyExists(application[local.appKey].$oracleNativeBoolean, local.dsName)) {
+			local.supported = false;
+			try {
+				local.creds = $migratorDataSourceCredentials();
+				local.info = $dbinfo(
+					type = "version",
+					datasource = local.dsName,
+					username = local.creds.username,
+					password = local.creds.password
+				);
+				// e.g. "Oracle AI Database 26ai Free Release 23.26.1.0.0 - ..." or
+				// "Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - ...".
+				local.match = ReFind("([0-9]+)\.[0-9]+", local.info.database_version, 1, true);
+				if (ArrayLen(local.match.pos) > 1 && local.match.pos[2] > 0) {
+					local.supported = Val(Mid(local.info.database_version, local.match.pos[2], local.match.len[2])) >= 23;
+				}
+			} catch (any e) {
+				local.supported = false;
+			}
+			application[local.appKey].$oracleNativeBoolean[local.dsName] = local.supported;
+		}
+		return application[local.appKey].$oracleNativeBoolean[local.dsName];
+	}
+
+	/**
+	 * True when the migrator's server can generate a UUID in a column default (#4094):
+	 * PostgreSQL 13+ (`gen_random_uuid()`), MySQL 8.0.13+ or MariaDB 10.2+ (`(UUID())`).
+	 * Other databases always can. Read from the server version once per datasource and
+	 * memoized; an unreadable version reads as "yes", the DDL every supported release accepts.
+	 */
+	public boolean function $serverSupportsUuidDefault(required string dbType, string dataSource = "") {
+		if (!ListFindNoCase("PostgreSQL,MySQL", arguments.dbType)) {
+			return true;
+		}
+		local.appKey = $appKey();
+		local.dsName = Len(arguments.dataSource) ? arguments.dataSource : $migratorDataSource();
+		if (!StructKeyExists(application[local.appKey], "$uuidDefaultSupport")) {
+			application[local.appKey].$uuidDefaultSupport = {};
+		}
+		if (!StructKeyExists(application[local.appKey].$uuidDefaultSupport, local.dsName)) {
+			local.state = {supported = true};
+			try {
+				local.creds = $migratorDataSourceCredentials();
+				local.info = $dbinfo(
+					type = "version",
+					datasource = local.dsName,
+					username = local.creds.username,
+					password = local.creds.password
+				);
+				local.state.supported = $uuidDefaultVersionSupported(dbType = arguments.dbType, version = local.info.database_version);
+			} catch (any e) {
+				// keep the default: an unreadable version reads as supported
+			}
+			application[local.appKey].$uuidDefaultSupport[local.dsName] = local.state.supported;
+		}
+		return application[local.appKey].$uuidDefaultSupport[local.dsName];
+	}
+
+	/**
+	 * Internal function. Decides $serverSupportsUuidDefault() from a server version string,
+	 * e.g. "18.4 (Debian 18.4-1)", "8.0.12", "10.11.6-MariaDB".
+	 */
+	public boolean function $uuidDefaultVersionSupported(required string dbType, required string version) {
+		// MariaDB through the MySQL driver often reports "5.5.5-10.11.6-MariaDB": drop the
+		// 5.5.5- compatibility prefix so the real version is read.
+		local.version = ReReplace(arguments.version, "^5\.5\.5-", "");
+		local.parts = ReMatch("[0-9]+", local.version);
+		if (ArrayLen(local.parts) < 2) {
+			return true;
+		}
+		local.major = Val(local.parts[1]);
+		local.minor = Val(local.parts[2]);
+		local.patch = ArrayLen(local.parts) > 2 ? Val(local.parts[3]) : 0;
+		if (arguments.dbType == "PostgreSQL") {
+			return local.major >= 13;
+		}
+		if (FindNoCase("mariadb", local.version)) {
+			return local.major > 10 || (local.major == 10 && local.minor >= 2);
+		}
+		return local.major > 8 || (local.major == 8 && (local.minor > 0 || local.patch >= 13));
+	}
+
 	private string function $getForeignKeys(required string table) {
 		local.appKey = $appKey();
 		local.foreignKeyList = "";

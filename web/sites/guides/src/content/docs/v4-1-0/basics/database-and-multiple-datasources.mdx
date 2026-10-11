@@ -38,7 +38,7 @@ The name you set here must match a datasource registered with your CFML engine �
 
 Where the registration lives depends on what serves your app:
 
-**With the wheels CLI** — datasources live in `lucee.json` at the app root. `wheels new` writes the SQLite pair for you; add more under `configuration.datasources` using the same shape:
+**With the wheels CLI** — datasources live in `lucee.json` at the app root. `wheels new` writes the SQLite pair for you (it also registers them as `this.datasources` in `config/app.cfm`); add more under `configuration.datasources` using the same shape:
 
 ```json title="lucee.json (excerpt — the shape wheels new generates)"
 "configuration": {
@@ -56,7 +56,7 @@ Where the registration lives depends on what serves your app:
 
 For MySQL/Postgres, swap `class`/`dsn` for the driver's JDBC form (e.g. `com.mysql.cj.jdbc.Driver` with `jdbc:mysql://localhost:3306/myapp`). Restart the server (`wheels stop && wheels start`) after editing.
 
-**With CommandBox** — the scaffolded `box.json` already includes `commandbox-cfconfig`; declare datasources in `server.json` and CFConfig applies them at server start:
+**With CommandBox** — apps installed with CommandBox (`box install wheels-base-template`) ship a `box.json` that includes `commandbox-cfconfig`; declare datasources in `server.json` and CFConfig applies them at server start. A `wheels new` app has no `box.json` or `server.json`:
 
 ```json title="server.json (excerpt)"
 "cfconfig": {
@@ -78,7 +78,7 @@ If the app connects but models and the migrator act as if your tables don't exis
 </Aside>
 
 <Aside type="note" title="Adobe ColdFusion 2025: install graphqlclient">
-Install the `graphqlclient` package (`cfpm install graphqlclient`). Without it, Adobe ColdFusion 2025 raises `The graphqlclient package is not installed.` while loading your application's datasources at startup, and the error log records it after every restart, even though the app never uses GraphQL. Installing the package stops the notice and the log noise.
+Install the `graphqlclient` package (`cfpm install graphqlclient`). Without it, Adobe ColdFusion 2025 raises `The graphqlclient package is not installed.` while loading your application's datasources at startup, and the error log records it after every restart, even though the app never uses GraphQL. Installing the package stops the notice and the log noise. Wheels itself also needs the `image`, `mail`, `zip` and `caching` packages, and a MySQL datasource needs the Connector/J jar in `cfusion/lib`; see [Manual Installation](/v4-1-0/start-here/manual-installation/#adobe-coldfusion-2025).
 </Aside>
 
 ## Per-environment datasource
@@ -178,12 +178,14 @@ component extends="Controller" {
 
 The invoked method must return a boolean — `invokeWithTransaction()` throws `Methods invoked using invokeWithTransaction must return a boolean value` otherwise. Returning `true` commits; returning `false` rolls the transaction back, even with `transaction="commit"`. Make sure `settleOutstandingCharges()` ends with `return true;` on its success path.
 
-**Multiple statements, multiple models.** Use a native CFML `transaction{}` block. Everything inside runs against the same connection and commits or rolls back as a unit. An uncaught exception inside rolls back automatically; an explicit rollback uses `transaction action="rollback"`.
+**Multiple statements, multiple models.** Use a native CFML `transaction` block with `isolation="read_committed"`. Everything inside runs against the same connection and commits or rolls back as a unit. An uncaught exception inside rolls back automatically; an explicit rollback uses `transaction action="rollback"`.
+
+Keep the `isolation` attribute. Each model write asks for a transaction at `read_committed`. On Lucee and BoxLang a write inside the block joins it, but Adobe ColdFusion treats it as a nested transaction and rejects it when its isolation level differs from the block's. Without the attribute, a write inside the block can fail on Adobe with `Nested cftransaction tag should specify same isolation level as the parent` ([#4045](https://github.com/wheels-dev/wheels/issues/4045)). The attribute also sets the isolation level for the whole block, which can differ from your database's default (MySQL's InnoDB defaults to `REPEATABLE READ`).
 
 ```cfm {test:compile}
 component extends="Controller" {
     function transfer() {
-        transaction {
+        transaction isolation="read_committed" {
             from = model("Account").findByKey(params.fromKey);
             to = model("Account").findByKey(params.toKey);
             from.update(balance=from.balance - params.amount);

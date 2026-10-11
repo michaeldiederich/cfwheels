@@ -77,6 +77,11 @@ component {
 		return new Boot(b);
 	}
 
+	/** The `migrate:` block (#4063); disabled when absent. */
+	public any function migrate() {
+		return new Migrate(structKeyExists(variables.raw, "migrate") ? variables.raw.migrate : false);
+	}
+
 	public array function roles() {
 		var servers = variables.raw.servers;
 
@@ -112,6 +117,13 @@ component {
 		var reg = registry().server();
 		var prefix = (reg == "docker.io") ? "" : reg & "/";
 		return prefix & image() & ":" & new DeployToken().assert(arguments.version, "version");
+	}
+
+	/** Top-level `volumes:` mounted on every app container (#4018). */
+	public array function volumes() {
+		return (structKeyExists(variables.raw, "volumes") && isArray(variables.raw.volumes))
+			? variables.raw.volumes
+			: [];
 	}
 
 	public array function accessories() {

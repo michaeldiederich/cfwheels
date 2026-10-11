@@ -624,7 +624,7 @@ component extends="wheels.WheelsTest" {
 			})
 
 			it("is selecting users groupby addresses", () => {
-				q = user.findAll(select = "address", group = "address", order = "address", result = "result")
+				q = user.findAll(select = "address", group = "address", order = "address")
 
 				expect(q.recordcount).toBe(4)
 
@@ -862,7 +862,7 @@ component extends="wheels.WheelsTest" {
 			it("function findAll returns correct type when returnAs is struct when no records", () => {
 				q = user.findAll(where = "id = 0", returnas = "structs")
 
-				expect(q).toBeStruct()
+				expect(q).toBeArray()
 				expect(q).toBeEmpty()
 			})
 
@@ -1319,6 +1319,23 @@ component extends="wheels.WheelsTest" {
 				)
 			})
 
+			// joinType "left" / "left outer" are aliases of "outer". Before, "left" emitted
+			// "LEFT JOIN", which the nested-include grouping does not recognise, so the
+			// nested INNER join to tags was silently dropped ("unknown column").
+			it("treats joinType left as outer and keeps a nested include", () => {
+				var expected = "FROM #qi('c_o_r_e_posts')#"
+					& " LEFT OUTER JOIN (#qi('c_o_r_e_classifications')# INNER JOIN #qi('c_o_r_e_tags')# ON #qi('c_o_r_e_classifications')#.#qi('tagid')# = #qi('c_o_r_e_tags')#.#qi('id')#) ON #qi('c_o_r_e_posts')#.#qi('id')# = #qi('c_o_r_e_classifications')#.#qi('postid')#"
+				expect(g.model("postLeftJoin").$fromClause(include = "classifications(tag)")).toBe(expected)
+				expect(g.model("postLeftOuterJoin").$fromClause(include = "classifications(tag)")).toBe(expected)
+			})
+
+			it("rejects an unknown joinType", () => {
+				var callModel = () => {
+					g.model("postUnknownJoin").$fromClause(include = "classifications")
+				}
+				expect(callModel).toThrow("Wheels.InvalidJoinType")
+			})
+
 			// Second shape of issue #3334, and a residual case of issue #3245 that the
 			// #3245 gate does not cover: a ROOT-level inner join (`Post.author` is a
 			// belongsTo) alongside a nested group. Its ON clause references the root
@@ -1528,7 +1545,9 @@ component extends="wheels.WheelsTest" {
 			})
 
 			it("is working with include and identical columns", () => {
-				result = g.model("post").findAll(include = "c_o_r_e_comments", order = "createdAt,createdAt")
+				// createdAt ties across the seeded posts, so a primary-key tiebreak is needed
+				// for a deterministic first row (matches the sibling cases; #4179).
+				result = g.model("post").findAll(include = "c_o_r_e_comments", order = "createdAt,createdAt,id")
 
 				expect(result['title'][1]).toBe("Title for first test post")
 			})
@@ -1546,7 +1565,9 @@ component extends="wheels.WheelsTest" {
 			})
 
 			it("is working with paginated include and identical columns", () => {
-				result = g.model("post").findAll(page = 1, perPage = 3, include = "c_o_r_e_comments", order = "createdAt")
+				// createdAt ties across the seeded posts; add the primary-key tiebreak so the
+				// first page's first row is deterministic (#4179).
+				result = g.model("post").findAll(page = 1, perPage = 3, include = "c_o_r_e_comments", order = "createdAt,id")
 
 				expect(result['title'][1]).toBe("Title for first test post")
 			})

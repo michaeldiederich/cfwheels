@@ -1,0 +1,50 @@
+---
+title: "wheels deploy app boot"
+description: Run new app containers for the given version on every host in every role.
+type: reference
+sidebar:
+  label: "boot"
+  order: 1
+---
+
+`docker run` new containers for the given version, on every host in every role.
+
+## Synopsis
+
+```txt title="
+wheels deploy app boot --release=<v> [--role=<name>] [--destination=<name>] [--dry-run]
+```
+
+## Flags
+
+| Flag | Description |
+|------|-------------|
+| `--release=<v>` | **Required.** Version to boot. Throws `DeployAppCli.MissingVersion` if absent. |
+| `--role=<name>` | Limit to one role. Default: every role. |
+| `--destination=<name>` | Overlay `deploy.<name>.yml`. |
+| `--dry-run` | Print the `docker run` commands without executing. |
+
+`--version=<v>` is accepted as an alias of `--release=<v>`. Purely numeric release values such as `--release=1` work.
+
+## Behavior
+
+For each host in each role, emits the command below. When `env.secret` lists keys, `boot` first creates the role's env file on the host and uploads the secret values to it (`--env-file` is only added in that case).
+
+```txt title="
+docker run --detach --restart unless-stopped \
+  --name <service>-<role>-<version> \
+  --network kamal \
+  --label service=<service> --label role=<role> --label destination=<dest> --label version=<v> \
+  -e KEY=VALUE ... \
+  --env-file .kamal/apps/<service>/env/roles/<role>.env \
+  <image>:<version>
+```
+
+`boot` does **not** ask the proxy to cut traffic — that's what `wheels deploy` does. Use `boot` for a stand-alone container bring-up; use `wheels deploy` for a full zero-downtime rollout.
+
+## Example
+
+```bash title="example"
+wheels deploy app boot --release=abc1234
+wheels deploy app boot --release=abc1234 --role=job
+```

@@ -250,15 +250,6 @@ component extends="wheels.WheelsTest" {
 			});
 
 			it("advances the poll cursor past filtered events", function() {
-				// MockBox writes its generated method stubs to /testbox/system/stubs
-				// (webroot-relative) and removes them after mixing in — make sure the
-				// directory exists
-				// DirectoryCreate(path, true) is Lucee-only (issue ##2567);
-				// java.io.File.mkdirs() recurses parents on every engine and
-				// is a no-op when the directory already exists.
-				var stubDir = ExpandPath("/testbox/system/stubs");
-				CreateObject("java", "java.io.File").init(stubDir).mkdirs();
-
 				// First poll returns two events whose type does NOT match the filter;
 				// second poll must resume after the newest of them, not re-fetch them
 				var firstPoll = QueryNew(
@@ -304,6 +295,43 @@ component extends="wheels.WheelsTest" {
 				// Filtered events must not be delivered to the client
 				expect(ArrayLen(_controller.$callLog().sendSSEEvent)).toBe(0);
 			});
+		});
+
+		describe("subscribeToChannel input parsing", function() {
+
+			beforeEach(function() {
+				params = {controller = "dummy", action = "dummy"};
+				_controller = g.controller("dummy", params);
+			});
+
+			it("trims whitespace around event-filter names so every name matches", function() {
+				expect(_controller.$parseEventFilter("a, b")).toBe(["a", "b"]);
+				expect(_controller.$parseEventFilter(" a ,, b ")).toBe(["a", "b"]);
+				expect(_controller.$parseEventFilter("")).toBe([]);
+			});
+
+			it("resolves lastEventId with explicit > Last-Event-ID header > lastEventId url param", function() {
+				// An explicitly passed id wins.
+				expect(
+					_controller.$resolveLastEventId(explicit = "x", requestHeaders = {"Last-Event-ID": "h"}, requestParams = {lastEventId: "p"})
+				).toBe("x");
+				// The native EventSource header wins over the url param.
+				expect(
+					_controller.$resolveLastEventId(explicit = "", requestHeaders = {"Last-Event-ID": "h"}, requestParams = {lastEventId: "p"})
+				).toBe("h");
+				// The bundled WheelsSSE client sends only the url param — it must be honoured.
+				expect(
+					_controller.$resolveLastEventId(explicit = "", requestHeaders = {}, requestParams = {lastEventId: "p"})
+				).toBe("p");
+				// Values are trimmed; nothing resolves to "".
+				expect(
+					_controller.$resolveLastEventId(explicit = "", requestHeaders = {}, requestParams = {lastEventId: " p "})
+				).toBe("p");
+				expect(
+					_controller.$resolveLastEventId(explicit = "", requestHeaders = {}, requestParams = {})
+				).toBe("");
+			});
+
 		});
 
 		describe("Controller Mixin Availability", function() {

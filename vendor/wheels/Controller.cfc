@@ -1,8 +1,12 @@
 component output="false" displayName="Controller" extends="wheels.Global"{
 
 	function init(){
-		$integrateComponents("wheels.controller");
-		$integrateComponents("wheels.view");
+		if ($controllerIntegrationCacheEnabled()) {
+			$applyCachedIntegration();
+		} else {
+			$integrateComponents("wheels.controller");
+			$integrateComponents("wheels.view");
+		}
 		return this;
 	}
 
@@ -56,6 +60,9 @@ component output="false" displayName="Controller" extends="wheels.Global"{
 		$setFlashStorage($get("flashStorage"));
 		$setFlashAppend($get("flashAppend"));
 
+		// The application's global helpers, so config() can call them.
+		$includeGlobalHelpers();
+
 		// Call the developer's "config" function if it exists.
 		if (StructKeyExists(variables, "config")) {
 			config();
@@ -66,12 +73,40 @@ component output="false" displayName="Controller" extends="wheels.Global"{
 	}
 
 	/**
+	 * Internal function. Includes the application's global helper file (`<viewPath>/helpers.cfm`)
+	 * into this object, once per object: called from $initControllerClass() and
+	 * $initControllerObject(). It used to be included in the pseudo-constructor, which relies on
+	 * the engine running that per instance, and only while the application scope was ready. Whether
+	 * the file exists is checked once and kept in helperFileCache (under a key no controller name
+	 * can take) when cacheFileChecking is on, like the controller-specific helper file.
+	 */
+	public void function $includeGlobalHelpers() {
+		local.template = $get("viewPath") & "/helpers.cfm";
+		local.cacheKey = "$global";
+		local.canCache = StructKeyExists(application, "wheels") && StructKeyExists(application.wheels, "helperFileCache");
+		if (local.canCache && StructKeyExists(application.wheels.helperFileCache, local.cacheKey)) {
+			local.exists = application.wheels.helperFileCache[local.cacheKey];
+		} else {
+			local.exists = FileExists(ExpandPath(local.template));
+			if (local.canCache && $get("cacheFileChecking")) {
+				application.wheels.helperFileCache[local.cacheKey] = local.exists;
+			}
+		}
+		if (local.exists) {
+			$include(template = local.template);
+		}
+	}
+
+	/**
 	 * Initialize the controller instance level object and return it.
 	 */
 	public any function $initControllerObject(required string name, required struct params) {
 		// Create a struct for storing request specific data.
 		variables.$instance = {};
 		variables.$instance.contentFor = {};
+
+		// The application's global helpers first, so a controller helper can override one.
+		$includeGlobalHelpers();
 
 		// Set file name to look for (e.g. "app/views/folder/helpers.cfm").
 		// Name could be dot notation so we need to change delimiters.
@@ -361,14 +396,6 @@ component output="false" displayName="Controller" extends="wheels.Global"{
 		return false;
 	}
 
-	if (
-		IsDefined("application")
-		&& StructKeyExists(application, "wheels")
-		&& StructKeyExists(application.wheels, "viewPath")
-	) {
-		include "#application.wheels.viewPath#/helpers.cfm";
-	}
-
 	/**
 	 * Gets all the component files from the provided path
 	 *
@@ -425,6 +452,141 @@ component output="false" displayName="Controller" extends="wheels.Global"{
 				local.superName = "super" & local.name;
 				variables[local.superName] = local.ref;
 				this[local.superName] = local.ref;
+			}
+		}
+	}
+
+	/**
+	 * Whether init() applies this class's cached integration result (#4149) instead of
+	 * mixing the controller and view methods in one at a time. On outside development
+	 * (cacheControllerIntegration); development keeps the loop, because controller
+	 * methods are edited there without a reload.
+	 */
+	private boolean function $controllerIntegrationCacheEnabled() {
+		return StructKeyExists(application, "wheels")
+			&& StructKeyExists(application.wheels, "cacheControllerIntegration")
+			&& application.wheels.cacheControllerIntegration;
+	}
+
+	/**
+	 * Mix the controller and view methods into this instance from the per-class result
+	 * that $buildControllerIntegration() computes once (#4149): the same keys and refs
+	 * the per-method loop writes, applied with StructAppend. New methods never overwrite
+	 * a name the instance already has; super<name> aliases always do, as in the loop.
+	 * If a name the result treats as already present (an override) is missing on this
+	 * instance, the class changed since the result was built, so this instance takes
+	 * the loop and the result is rebuilt for the next one.
+	 */
+	private void function $applyCachedIntegration() {
+		local.result = $controllerIntegrationResult();
+		if (!$integrationCollisionsPresent(local.result.collisions)) {
+			$integrateComponents("wheels.controller");
+			$integrateComponents("wheels.view");
+			$forgetControllerIntegration(local.result.key);
+			return;
+		}
+		StructAppend(variables, local.result.adds, false);
+		StructAppend(this, local.result.adds, false);
+		StructAppend(variables, local.result.supers, true);
+		StructAppend(this, local.result.supers, true);
+	}
+
+	/**
+	 * This class's cached integration result, built from this instance the first time.
+	 */
+	private struct function $controllerIntegrationResult() {
+		local.key = $controllerIntegrationKey();
+		if (
+			StructKeyExists(application.wheels, "controllerIntegration")
+			&& StructKeyExists(application.wheels.controllerIntegration, local.key)
+		) {
+			return application.wheels.controllerIntegration[local.key];
+		}
+		local.result = $buildControllerIntegration(local.key);
+		lock name="wheels.integrationPlans.#application.applicationName#" type="exclusive" timeout="10" {
+			if (!StructKeyExists(application.wheels, "controllerIntegration")) {
+				application.wheels.controllerIntegration = {};
+			}
+			application.wheels.controllerIntegration[local.key] = local.result;
+		}
+		return local.result;
+	}
+
+	/**
+	 * The cache key for this instance's class: its full component name.
+	 */
+	private string function $controllerIntegrationKey() {
+		local.meta = GetMetaData(this);
+		if (StructKeyExists(local.meta, "fullName") && Len(local.meta.fullName)) {
+			return local.meta.fullName;
+		}
+		return local.meta.name;
+	}
+
+	/**
+	 * Run the integration loop's decisions without writing to this instance, and return
+	 * what it would write: `adds` (name -> ref), `supers` (super<name> -> ref, in loop
+	 * order) and `collisions` (names the instance already had, i.e. its overrides).
+	 * The plans and the mixin-override set are per application and the names present
+	 * before integration are fixed per class, so the result holds for every instance.
+	 */
+	private struct function $buildControllerIntegration(required string key) {
+		local.rv = {key = arguments.key, adds = {}, supers = {}, collisions = []};
+		local.overrideSet = $mixinOverrideSet("controller");
+		for (local.path in ["wheels.controller", "wheels.view"]) {
+			local.plan = $componentIntegrationPlan(local.path);
+			local.iEnd = ArrayLen(local.plan);
+			for (local.i = 1; local.i <= local.iEnd; local.i++) {
+				$simulateIntegration(local.plan[local.i].publicMethods, local.overrideSet, local.rv);
+			}
+		}
+		return local.rv;
+	}
+
+	/**
+	 * The decisions $integrateFunctions() makes for one component's methods, recorded
+	 * in `result` instead of written to the instance. A name added earlier in the
+	 * simulation counts as present, as it would after the loop's write.
+	 */
+	private void function $simulateIntegration(required array publicMethods, required struct overrideSet, required struct result) {
+		local.iEnd = ArrayLen(arguments.publicMethods);
+		for (local.i = 1; local.i <= local.iEnd; local.i++) {
+			local.name = arguments.publicMethods[local.i].name;
+			local.ref = arguments.publicMethods[local.i].ref;
+			if (!(StructKeyExists(variables, local.name) || StructKeyExists(this, local.name) || StructKeyExists(arguments.result.adds, local.name))) {
+				arguments.result.adds[local.name] = local.ref;
+			} else {
+				arguments.result.supers["super" & local.name] = local.ref;
+				if (!StructKeyExists(arguments.result.adds, local.name) && !ArrayFindNoCase(arguments.result.collisions, local.name)) {
+					ArrayAppend(arguments.result.collisions, local.name);
+				}
+			}
+			if (StructKeyExists(arguments.overrideSet, local.name)) {
+				arguments.result.supers["super" & local.name] = local.ref;
+			}
+		}
+	}
+
+	/**
+	 * Whether every name in `names` is still defined on this instance.
+	 */
+	private boolean function $integrationCollisionsPresent(required array names) {
+		local.iEnd = ArrayLen(arguments.names);
+		for (local.i = 1; local.i <= local.iEnd; local.i++) {
+			if (!(StructKeyExists(variables, arguments.names[local.i]) || StructKeyExists(this, arguments.names[local.i]))) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	/**
+	 * Drop one class's cached integration result, so the next instance rebuilds it.
+	 */
+	private void function $forgetControllerIntegration(required string key) {
+		lock name="wheels.integrationPlans.#application.applicationName#" type="exclusive" timeout="10" {
+			if (StructKeyExists(application.wheels, "controllerIntegration")) {
+				StructDelete(application.wheels.controllerIntegration, arguments.key);
 			}
 		}
 	}

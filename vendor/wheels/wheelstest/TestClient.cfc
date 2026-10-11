@@ -24,20 +24,267 @@ component {
 	variables.contentCache = "";
 	variables.jsonCached = false;
 	variables.jsonCache = "";
+	// The session's authenticity token, picked up from a page this client fetched
+	// and sent on unsafe requests (see csrfToken()). Per instance, never shared.
+	variables.csrfTokenValue = "";
+	variables.csrfSessionFingerprint = "";
+	variables.csrfEnabled = true;
 
 	/**
 	 * Initialize the test client with a base URL.
 	 *
-	 * @baseUrl The base URL for all requests (e.g. "http://localhost:8080")
+	 * @baseUrl     The base URL for all requests (e.g. "http://localhost:8080").
+	 * @testContext Send the test context (header and cookie) with every request
+	 *              when the client is created inside a test-runner request and
+	 *              baseUrl points at the test server (see $isTestHost()), so the
+	 *              requests reach the same isolated test application as the spec
+	 *              code. Pass false to address the live application.
 	 */
-	public TestClient function init(string baseUrl = "http://localhost:8080") {
+	public TestClient function init(string baseUrl = "http://localhost:8080", boolean testContext = true) {
 		variables.baseUrl = arguments.baseUrl;
 		variables.lastResponse = {};
 		variables.defaultHeaders = {};
 		variables.cookies = {};
 		variables.sendAsJson = false;
+		variables.csrfTokenValue = "";
+		variables.csrfSessionFingerprint = "";
+		variables.csrfEnabled = true;
 		$clearResponseCaches();
+		if (arguments.testContext) {
+			$attachTestContext();
+		}
 		return this;
+	}
+
+	/**
+	 * Adds the test-context header and cookie when this client is created
+	 * inside a test-runner request (the isolated test application, in
+	 * development or testing; a thread started during the run is in the same
+	 * application) and baseUrl points at the test server. A client created
+	 * outside a test run, such as in a scheduled task or a script, or one aimed
+	 * at any other host, sends nothing extra.
+	 */
+	private void function $attachTestContext() {
+		var ctx = new wheels.events.TestContext();
+		if (!ctx.currentRequestIsIsolated() || !$isTestHost(variables.baseUrl)) {
+			return;
+		}
+		var testSecret = ctx.testSecret();
+		withHeader(ctx.headerName(), testSecret);
+		withCookie(ctx.cookieName(), testSecret);
+	}
+
+	/**
+	 * True when `target` points at the test server: its host is a loopback address
+	 * (localhost, 127.x.x.x, [::1]) or the host of an explicitly configured test
+	 * base URL (the testClientBaseUrl setting, -Dwheels.testClient.baseUrl, or
+	 * WHEELS_TEST_CLIENT_BASE_URL). Hosts are compared exactly after the URL is
+	 * parsed, with no DNS lookup, so localhost.example.com or
+	 * 127.0.0.1.example.com do not match. Public for specs.
+	 */
+	public boolean function $isTestHost(required string target) {
+		var host = $urlHost(arguments.target);
+		if (!Len(host)) {
+			return false;
+		}
+		if (host == "localhost" || host == "[::1]" || host == "::1" || $isLoopbackIPv4(host)) {
+			return true;
+		}
+		for (var configured in $configuredTestBaseUrls()) {
+			if (Compare($urlHost(configured), host) == 0) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * The lower-cased host of an absolute http(s) URL, or "" when it has none or
+	 * is not one. Parsed with java.net.URI where the engine provides it, and
+	 * with $lexicalUrlHost() otherwise (an engine without a JVM). Both paths
+	 * first refuse anything $lexicalUrlHost() refuses: another scheme, or an
+	 * authority holding a backslash, whitespace, '%' or a control character.
+	 * Public for specs.
+	 */
+	public string function $urlHost(required string target) {
+		var lexical = $lexicalUrlHost(arguments.target);
+		if (!Len(lexical) || !$uriAvailable()) {
+			return lexical;
+		}
+		var state = {host = ""};
+		try {
+			state.parsed = CreateObject("java", "java.net.URI").init(Trim(arguments.target)).getHost();
+			if (!IsNull(state.parsed)) {
+				state.host = LCase(state.parsed);
+			}
+		} catch (any e) {
+			// Not a parseable absolute URL: no host.
+		}
+		return state.host;
+	}
+
+	/** True when java.net.URI can be created and parses a known URL. Public for specs. */
+	public boolean function $uriAvailable() {
+		var state = {ok = false};
+		try {
+			state.probe = CreateObject("java", "java.net.URI").init("http://localhost:1/").getHost();
+			state.ok = !IsNull(state.probe) && Compare(state.probe, "localhost") == 0;
+		} catch (any e) {
+			// No JVM: java.net.URI is not available.
+		}
+		return state.ok;
+	}
+
+	/**
+	 * The lower-cased host of an absolute http(s) URL, parsed without
+	 * java.net.URI, or "" when it has none or is not one. The authority runs from
+	 * '://' to the first '/', '?' or '#'; anything up to its LAST '@' is user
+	 * information; a port must be digits; an IPv6 host keeps its brackets. An
+	 * authority holding a backslash, whitespace, '%' or a control character is
+	 * refused outright. Public for specs.
+	 */
+	public string function $lexicalUrlHost(required string target) {
+		var raw = Trim(arguments.target);
+		if (REFindNoCase("^https?://", raw) != 1) {
+			return "";
+		}
+		var rest = Mid(raw, Find("://", raw) + 3, Len(raw));
+		var cutAt = REFind("[/?##]", rest);
+		var authority = rest;
+		if (cutAt == 1) {
+			return "";
+		} else if (cutAt > 1) {
+			authority = Left(rest, cutAt - 1);
+		}
+		if (!Len(authority) || !$isPlainAuthority(authority)) {
+			return "";
+		}
+		var hostPort = authority;
+		var atFromEnd = Find("@", Reverse(authority));
+		if (atFromEnd > 0) {
+			hostPort = Mid(authority, Len(authority) - atFromEnd + 2, Len(authority));
+		}
+		var host = "";
+		var port = "";
+		if (Left(hostPort, 1) == "[") {
+			var closeAt = Find("]", hostPort);
+			if (closeAt < 3) {
+				return "";
+			}
+			host = Left(hostPort, closeAt);
+			var afterHost = Mid(hostPort, closeAt + 1, Len(hostPort));
+			if (Len(afterHost) && (Left(afterHost, 1) != ":")) {
+				return "";
+			}
+			port = Len(afterHost) ? Mid(afterHost, 2, Len(afterHost)) : "";
+			if (!REFind("^\[[0-9A-Fa-f:.]+\]$", host)) {
+				return "";
+			}
+		} else {
+			var colonAt = Find(":", hostPort);
+			if (colonAt == 0) {
+				host = hostPort;
+			} else {
+				host = colonAt > 1 ? Left(hostPort, colonAt - 1) : "";
+				port = Mid(hostPort, colonAt + 1, Len(hostPort));
+			}
+			if (!$isHostName(host)) {
+				return "";
+			}
+		}
+		if (Len(port) && !REFind("^[0-9]{1,5}$", port)) {
+			return "";
+		}
+		return LCase(host);
+	}
+
+	/**
+	 * A host name or IPv4 address in the RFC 2396 sense java.net.URI applies:
+	 * either four dot-separated numbers of 0-255, or dot-separated labels of
+	 * letters, digits and inner hyphens whose last label starts with a letter.
+	 */
+	private boolean function $isHostName(required string host) {
+		var labels = ListToArray(arguments.host, ".", true);
+		if (!ArrayLen(labels)) {
+			return false;
+		}
+		var allNumeric = true;
+		for (var label in labels) {
+			if (!REFind("^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$", label)) {
+				return false;
+			}
+			if (!REFind("^[0-9]+$", label)) {
+				allNumeric = false;
+			}
+		}
+		if (allNumeric) {
+			if (ArrayLen(labels) != 4) {
+				return false;
+			}
+			for (var octet in labels) {
+				if (Len(octet) > 3 || Val(octet) > 255) {
+					return false;
+				}
+			}
+			return true;
+		}
+		return REFind("^[A-Za-z]", labels[ArrayLen(labels)]) == 1;
+	}
+
+	/** False when the authority holds a backslash, whitespace, '%' or a control character. */
+	private boolean function $isPlainAuthority(required string authority) {
+		var i = 0;
+		for (i = 1; i <= Len(arguments.authority); i++) {
+			var ch = Mid(arguments.authority, i, 1);
+			var code = Asc(ch);
+			if (code <= 32 || code == 127 || ch == "\" || ch == "%") {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	private boolean function $isLoopbackIPv4(required string host) {
+		if (!ReFind("^127\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$", arguments.host)) {
+			return false;
+		}
+		for (var octet in ListToArray(arguments.host, ".")) {
+			if (Val(octet) > 255) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	/** Test base URLs configured outside the request: the Wheels setting, the JVM property and the environment variable. */
+	private array function $configuredTestBaseUrls() {
+		var urls = [];
+		if (
+			StructKeyExists(application, "wheels")
+			&& StructKeyExists(application.wheels, "testClientBaseUrl")
+			&& IsSimpleValue(application.wheels.testClientBaseUrl)
+			&& Len(application.wheels.testClientBaseUrl)
+		) {
+			ArrayAppend(urls, application.wheels.testClientBaseUrl);
+		}
+		var state = {};
+		try {
+			state.property = CreateObject("java", "java.lang.System").getProperty("wheels.testClient.baseUrl");
+			if (!IsNull(state.property) && Len(state.property)) {
+				ArrayAppend(urls, state.property);
+			}
+		} catch (any e) {
+			// No JVM: no system property.
+		}
+		if (
+			StructKeyExists(server, "system")
+			&& StructKeyExists(server.system, "environment")
+			&& StructKeyExists(server.system.environment, "WHEELS_TEST_CLIENT_BASE_URL")
+			&& Len(server.system.environment.WHEELS_TEST_CLIENT_BASE_URL)
+		) {
+			ArrayAppend(urls, server.system.environment.WHEELS_TEST_CLIENT_BASE_URL);
+		}
+		return urls;
 	}
 
 	// ─── HTTP Methods ────────────────────────────────────────────────
@@ -48,13 +295,16 @@ component {
 	 * @path    URL path (appended to baseUrl)
 	 * @params  Query string parameters as a struct
 	 * @headers Additional headers for this request
+	 * @timeout cfhttp timeout in seconds (default 30). Lower it to bound a request that may hang so
+	 *          the caller's assertion fails rather than the whole test leg timing out.
 	 */
 	public TestClient function get(
 		required string path,
 		struct params = {},
-		struct headers = {}
+		struct headers = {},
+		numeric timeout = 30
 	) {
-		$makeRequest(method = "GET", path = arguments.path, params = arguments.params, headers = arguments.headers);
+		$makeRequest(method = "GET", path = arguments.path, params = arguments.params, headers = arguments.headers, timeout = arguments.timeout);
 		return this;
 	}
 
@@ -153,13 +403,29 @@ component {
 	}
 
 	/**
+	 * Set the client address (REMOTE_ADDR) for subsequent requests, so per-client behaviour
+	 * (RateLimiter, IP allow/deny rules) can be exercised. Sent as the X-Wheels-Test-Remote-Addr
+	 * header; in the isolated test application (development/testing only) the framework maps it onto
+	 * the middleware request context's `remoteAddr` field. It is ignored outside the isolated test
+	 * context and never changes the cgi scope, so app code reading cgi.remote_addr directly is
+	 * unaffected.
+	 *
+	 * @ip Client IP address the request should appear to come from.
+	 */
+	public TestClient function fromAddress(required string ip) {
+		return withHeader("X-Wheels-Test-Remote-Addr", arguments.ip);
+	}
+
+	/**
 	 * Set a cookie to send with subsequent requests.
 	 *
 	 * @name  Cookie name
 	 * @value Cookie value
 	 */
 	public TestClient function withCookie(required string name, required string value) {
-		variables.cookies[arguments.name] = arguments.value;
+		// Kept URL-encoded, the form a server sets it in: the jar goes back out as
+		// one Cookie header with each value as stored (see $cookieHeaderValue()).
+		variables.cookies[arguments.name] = URLEncodedFormat(arguments.value);
 		return this;
 	}
 
@@ -172,6 +438,85 @@ component {
 		variables.defaultHeaders["Content-Type"] = "application/json";
 		variables.defaultHeaders["Accept"] = "application/json";
 		return this;
+	}
+
+	// ─── CSRF ────────────────────────────────────────────────────────
+
+	/**
+	 * The authenticity token this client sends on POST/PUT/PATCH/DELETE: picked up
+	 * from the last page it fetched that had one (a csrf-token meta tag, else an
+	 * authenticityToken hidden field), as a browser would. It belongs to the
+	 * session: it is dropped when the session cookie changes (a login rotates it),
+	 * and the next page with a token refreshes it. "" when there is none.
+	 */
+	public string function csrfToken() {
+		return variables.csrfTokenValue;
+	}
+
+	/**
+	 * Use this authenticity token, for example one read from a JSON response.
+	 *
+	 * @token The token to send
+	 */
+	public TestClient function withCsrfToken(required string token) {
+		variables.csrfTokenValue = arguments.token;
+		variables.csrfSessionFingerprint = $sessionCookieFingerprint();
+		variables.csrfEnabled = true;
+		return this;
+	}
+
+	/**
+	 * Forget the token and stop picking one up, to test that a protected action
+	 * refuses a request without one. withCsrfToken() or fetchCsrfToken() turn it
+	 * back on.
+	 */
+	public TestClient function withoutCsrfToken() {
+		variables.csrfTokenValue = "";
+		variables.csrfEnabled = false;
+		return this;
+	}
+
+	/**
+	 * GET a page to pick up its authenticity token. Throws
+	 * Wheels.TestClient.CsrfTokenNotFound when the page has none.
+	 *
+	 * @path A page that renders csrfMetaTags() or a form
+	 */
+	public TestClient function fetchCsrfToken(string path = "/") {
+		variables.csrfEnabled = true;
+		// Only this page counts: a token held from an earlier page must not make a
+		// page without one look like it had one.
+		variables.csrfTokenValue = "";
+		get(path = arguments.path);
+		if (!Len(variables.csrfTokenValue)) {
+			Throw(
+				type = "Wheels.TestClient.CsrfTokenNotFound",
+				message = "No authenticity token on #arguments.path#: expected a <meta name=""csrf-token""> tag (csrfMetaTags()) or an authenticityToken hidden field (a form)."
+			);
+		}
+		return this;
+	}
+
+	/**
+	 * The authenticity token in an HTML page: the csrf-token meta tag's content,
+	 * else the first authenticityToken hidden field's value, HTML-decoded. "" when
+	 * there is neither. Public for specs ($-prefixed).
+	 */
+	public string function $extractCsrfToken(required string html) {
+		if (!FindNoCase("<meta", arguments.html) && !FindNoCase("<input", arguments.html)) {
+			return "";
+		}
+		for (var tag in ReMatchNoCase("<meta[^>]*>", arguments.html)) {
+			if (CompareNoCase($tagAttribute(tag, "name"), "csrf-token") == 0) {
+				return $decodeHtmlAttribute($tagAttribute(tag, "content"));
+			}
+		}
+		for (var tag in ReMatchNoCase("<input[^>]*>", arguments.html)) {
+			if (CompareNoCase($tagAttribute(tag, "name"), "authenticityToken") == 0) {
+				return $decodeHtmlAttribute($tagAttribute(tag, "value"));
+			}
+		}
+		return "";
 	}
 
 	// ─── Assertions ──────────────────────────────────────────────────
@@ -494,7 +839,8 @@ component {
 		required string path,
 		struct params = {},
 		struct body = {},
-		struct headers = {}
+		struct headers = {},
+		numeric timeout = 30
 	) {
 		$requireLeadingSlash(arguments.path);
 
@@ -514,18 +860,53 @@ component {
 		var mergedHeaders = StructCopy(variables.defaultHeaders);
 		StructAppend(mergedHeaders, arguments.headers, true);
 
+		// The session's authenticity token on unsafe requests: the X-CSRF-Token
+		// header, and the authenticityToken field on a form body. When the caller
+		// passed either one, that is the token: neither is added.
+		// A session cookie changed since the token was captured (withCookie(), or a
+		// test editing the jar): that token belongs to another session, so drop it
+		// before deciding what to send.
+		$dropCsrfTokenIfSessionChanged();
+		var requestBody = arguments.body;
+		if (
+			ListFindNoCase("POST,PUT,PATCH,DELETE", arguments.method)
+			&& variables.csrfEnabled
+			&& Len(variables.csrfTokenValue)
+			&& !$hasKeyNoCase(mergedHeaders, "X-CSRF-Token")
+			&& !$hasKeyNoCase(requestBody, "authenticityToken")
+		) {
+			mergedHeaders["X-CSRF-Token"] = variables.csrfTokenValue;
+			if (arguments.method != "DELETE" && !variables.sendAsJson) {
+				requestBody = StructCopy(requestBody);
+				requestBody["authenticityToken"] = variables.csrfTokenValue;
+			}
+		}
+
+		// The cookie jar goes out as one Cookie header, each value exactly as the
+		// server set it, as a browser sends it. Not cfhttpparam type="cookie": it
+		// URL-encodes the value again, so a value the server had already encoded
+		// (Adobe sends a+b as a%2Bb) arrived double-encoded and unreadable.
+		if (!StructIsEmpty(variables.cookies)) {
+			var cookieHeaderName = "Cookie";
+			for (var headerKey in mergedHeaders) {
+				if (CompareNoCase(headerKey, "Cookie") == 0) {
+					cookieHeaderName = headerKey;
+				}
+			}
+			var jarValue = $cookieHeaderValue();
+			mergedHeaders[cookieHeaderName] = StructKeyExists(mergedHeaders, cookieHeaderName) && Len(mergedHeaders[cookieHeaderName])
+				? mergedHeaders[cookieHeaderName] & "; " & jarValue
+				: jarValue;
+		}
+
 		var result = {};
 
-		cfhttp(url = fullUrl, method = arguments.method, timeout = "30", result = "result", redirect = false) {
+		cfhttp(url = fullUrl, method = arguments.method, timeout = arguments.timeout, result = "result", redirect = false) {
 			// Add merged headers
 			for (var hName in mergedHeaders) {
 				cfhttpparam(type = "header", name = hName, value = mergedHeaders[hName]);
 			}
 
-			// Add cookies
-			for (var cName in variables.cookies) {
-				cfhttpparam(type = "cookie", name = cName, value = variables.cookies[cName]);
-			}
 
 			// Add body for POST/PUT/PATCH. Adobe CF rejects a POST/PUT/PATCH
 			// cfhttp with zero cfhttpparam tags ("requires at least one
@@ -533,15 +914,15 @@ component {
 			// param for these methods — an empty body is valid — instead of
 			// skipping when the body struct is empty.
 			if (ListFindNoCase("POST,PUT,PATCH", arguments.method)) {
-				if (!StructIsEmpty(arguments.body) && !variables.sendAsJson) {
-					for (var fName in arguments.body) {
-						cfhttpparam(type = "formfield", name = fName, value = arguments.body[fName]);
+				if (!StructIsEmpty(requestBody) && !variables.sendAsJson) {
+					for (var fName in requestBody) {
+						cfhttpparam(type = "formfield", name = fName, value = requestBody[fName]);
 					}
 				} else {
 					// This branch covers both JSON posts (any body) and empty-body
 					// form posts — the latter still needs a body param so the POST
 					// isn't left with zero cfhttpparam tags.
-					cfhttpparam(type = "body", value = StructIsEmpty(arguments.body) ? "" : SerializeJSON(arguments.body));
+					cfhttpparam(type = "body", value = StructIsEmpty(requestBody) ? "" : SerializeJSON(requestBody));
 				}
 			}
 		}
@@ -550,22 +931,169 @@ component {
 		$clearResponseCaches();
 
 		// Track cookies from response for subsequent requests (session support)
-		if (StructKeyExists(result, "responseHeader") && StructKeyExists(result.responseHeader, "Set-Cookie")) {
-			var setCookieHeader = result.responseHeader["Set-Cookie"];
-			if (IsSimpleValue(setCookieHeader)) {
-				setCookieHeader = [setCookieHeader];
+		if (StructKeyExists(result, "responseHeader") && IsStruct(result.responseHeader)) {
+			$absorbSetCookies(result.responseHeader);
+		}
+
+		$syncCsrfToken();
+	}
+
+	/**
+	 * After a response: drop the token when the session cookie changed (a new
+	 * session has a new token), then pick up the token on this page, if any.
+	 */
+	private void function $syncCsrfToken() {
+		$dropCsrfTokenIfSessionChanged();
+		var fingerprint = $sessionCookieFingerprint();
+		if (!variables.csrfEnabled) {
+			return;
+		}
+		var found = $extractCsrfToken(content());
+		if (Len(found)) {
+			variables.csrfTokenValue = found;
+			variables.csrfSessionFingerprint = fingerprint;
+		}
+	}
+
+	/**
+	 * Forget the token when the session cookies differ from when it was captured.
+	 */
+	private void function $dropCsrfTokenIfSessionChanged() {
+		if (Len(variables.csrfTokenValue) && Compare($sessionCookieFingerprint(), variables.csrfSessionFingerprint) != 0) {
+			variables.csrfTokenValue = "";
+		}
+	}
+
+	/**
+	 * The values of the cookies that identify the session (CFID, CFTOKEN,
+	 * JSESSIONID, any *session* cookie), in name order, so a change to any of them
+	 * shows. Not the cookie-store CSRF cookie: it can be re-encrypted on every
+	 * response while the token inside it stays the same.
+	 */
+	private string function $sessionCookieFingerprint() {
+		var names = StructKeyArray(variables.cookies);
+		ArraySort(names, "textnocase");
+		var parts = [];
+		for (var name in names) {
+			if (ReFindNoCase("^(cfid|cftoken|jsessionid|bxid)$|session", name)) {
+				ArrayAppend(parts, LCase(name) & "=" & variables.cookies[name]);
 			}
-			for (var cookieStr in setCookieHeader) {
-				var cookieParts = ListToArray(cookieStr, ";");
-				if (ArrayLen(cookieParts)) {
-					var pair = Trim(cookieParts[1]);
-					var eqPos = Find("=", pair);
-					if (eqPos > 0) {
-						variables.cookies[Left(pair, eqPos - 1)] = Mid(pair, eqPos + 1, Len(pair) - eqPos);
-					}
+		}
+		return ArrayToList(parts, ";");
+	}
+
+	/**
+	 * An attribute's value from one HTML tag (double or single quotes), or "".
+	 */
+	private string function $tagAttribute(required string tag, required string attribute) {
+		var match = ReFindNoCase("[\s]" & arguments.attribute & "[\s]*=[\s]*(""([^""]*)""|'([^']*)')", arguments.tag, 1, true);
+		if (match.pos[1] == 0) {
+			return "";
+		}
+		if (ArrayLen(match.pos) >= 3 && match.pos[3] > 0) {
+			return Mid(arguments.tag, match.pos[3], match.len[3]);
+		}
+		if (ArrayLen(match.pos) >= 4 && match.pos[4] > 0) {
+			return Mid(arguments.tag, match.pos[4], match.len[4]);
+		}
+		return "";
+	}
+
+	/**
+	 * Decode the HTML entities an encoded attribute value can carry: numeric
+	 * (&#NN; and &#xHH;) and &amp; &quot; &lt; &gt; &apos;.
+	 */
+	private string function $decodeHtmlAttribute(required string value) {
+		var rv = arguments.value;
+		if (!Find(Chr(38), rv)) {
+			return rv;
+		}
+		var match = ReFind("&##(x[0-9A-Fa-f]+|[0-9]+);", rv, 1, true);
+		while (match.pos[1] > 0) {
+			var code = Mid(rv, match.pos[2], match.len[2]);
+			var charCode = Left(code, 1) == "x" ? InputBaseN(Mid(code, 2, Len(code) - 1), 16) : Val(code);
+			rv = (match.pos[1] > 1 ? Left(rv, match.pos[1] - 1) : "") & Chr(charCode) & Mid(rv, match.pos[1] + match.len[1], Len(rv));
+			match = ReFind("&##(x[0-9A-Fa-f]+|[0-9]+);", rv, match.pos[1] + 1, true);
+		}
+		rv = ReplaceNoCase(rv, "&quot;", """", "all");
+		rv = ReplaceNoCase(rv, "&lt;", "<", "all");
+		rv = ReplaceNoCase(rv, "&gt;", ">", "all");
+		rv = ReplaceNoCase(rv, "&apos;", "'", "all");
+		return ReplaceNoCase(rv, "&amp;", "&", "all");
+	}
+
+	private boolean function $hasKeyNoCase(required struct data, required string key) {
+		for (var existing in arguments.data) {
+			if (CompareNoCase(existing, arguments.key) == 0) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Keep each Set-Cookie's name=value for later requests (session support).
+	 * cfhttp hands Set-Cookie over as a simple value (one cookie), an array
+	 * (Lucee), or a struct keyed "1", "2", … (Adobe CF). A for-in over that
+	 * struct walks its keys, not the cookies, so on Adobe no cookie was kept and
+	 * every request started a new session. Public for specs ($-prefixed).
+	 */
+	public void function $absorbSetCookies(required struct responseHeader) {
+		if (!StructKeyExists(arguments.responseHeader, "Set-Cookie")) {
+			return;
+		}
+		var raw = arguments.responseHeader["Set-Cookie"];
+		var headerValues = [];
+		if (IsSimpleValue(raw)) {
+			headerValues = [raw];
+		} else if (IsArray(raw)) {
+			headerValues = raw;
+		} else if (IsStruct(raw)) {
+			var keys = StructKeyArray(raw);
+			var allNumeric = true;
+			for (var key in keys) {
+				if (!IsNumeric(key)) {
+					allNumeric = false;
+				}
+			}
+			ArraySort(keys, allNumeric ? "numeric" : "textnocase");
+			for (var key in keys) {
+				ArrayAppend(headerValues, raw[key]);
+			}
+		}
+		for (var cookieStr in headerValues) {
+			if (!IsSimpleValue(cookieStr)) {
+				continue;
+			}
+			var cookieParts = ListToArray(cookieStr, ";");
+			if (ArrayLen(cookieParts)) {
+				var pair = Trim(cookieParts[1]);
+				var eqPos = Find("=", pair);
+				if (eqPos > 0) {
+					variables.cookies[Left(pair, eqPos - 1)] = Mid(pair, eqPos + 1, Len(pair) - eqPos);
 				}
 			}
 		}
+	}
+
+	/**
+	 * The Cookie header for the jar: name=value pairs, values as stored. Public
+	 * for specs ($-prefixed).
+	 */
+	public string function $cookieHeaderValue() {
+		var pairs = [];
+		for (var name in variables.cookies) {
+			ArrayAppend(pairs, name & "=" & variables.cookies[name]);
+		}
+		return ArrayToList(pairs, "; ");
+	}
+
+	/**
+	 * A copy of the cookies this client sends, values as sent. Public for specs
+	 * ($-prefixed).
+	 */
+	public struct function $cookieJar() {
+		return Duplicate(variables.cookies);
 	}
 
 	/**

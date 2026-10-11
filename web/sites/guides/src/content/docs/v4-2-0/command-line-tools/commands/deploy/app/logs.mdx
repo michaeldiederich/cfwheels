@@ -1,0 +1,50 @@
+---
+title: "wheels deploy app logs"
+description: docker logs fanned out across every host. Tail, follow, and per-container filtering supported.
+type: reference
+sidebar:
+  label: "logs"
+  order: 7
+---
+
+`docker logs` fanned out across every host, prefixed by host. Reads each role's newest container by default; `--container` picks one by name.
+
+## Synopsis
+
+```txt title="
+wheels deploy app logs [--tail=<N>] [--follow] [--container=<name>] [--role=<name>] [--destination=<name>]
+```
+
+## Flags
+
+| Flag | Description |
+|------|-------------|
+| `--tail=<N>` | Trailing lines per host. Default 100. |
+| `--follow` | `docker logs --follow`. Leaves the connection open; Ctrl-C to stop. |
+| `--container=<name>` | Read this container's logs instead of each role's newest running container. |
+| `--role=<name>` | Limit to one role. A name that `deploy.yml` doesn't define stops the command with an error listing the roles it does define. |
+| `--destination=<name>` | Overlay destination config. |
+
+`--release` is not required.
+
+## Behavior
+
+Without `--container`, each host in the targeted role(s) reads the role's newest running container:
+
+```txt
+docker ps --latest --quiet --filter 'label=service=<service>' [--filter 'label=role=<role>' --filter 'label=destination=<destination>'] | xargs -r docker logs --tail <N> [--follow]
+```
+
+The role and destination filters are added for each role the command runs for, which is every targeted role. Without `--destination`, the destination filter is empty (`label=destination=`) and matches containers deployed without one.
+
+With `--container=<name>`, it runs `docker logs --tail <N> [--follow] <name>`, with the name shell-quoted. Output is line-buffered and prefixed with `[<host>]`.
+
+Under `--follow`, the command fans out in parallel and stays running until interrupted.
+
+## Examples
+
+```bash title="illustrative"
+wheels deploy app logs
+wheels deploy app logs --tail=500 --role=web
+wheels deploy app logs --container=myapp-web-abc1234 --follow
+```

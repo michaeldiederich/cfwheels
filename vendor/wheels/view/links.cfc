@@ -60,6 +60,10 @@ component {
 			if (local.args.encode == "attributes") {
 				local.args.encode = true;
 			}
+			// linkTo has already normalised its arguments via $args above, so tell URLFor to skip
+			// its redundant generic $args pass (it still applies its own set(functionName="URLFor")
+			// defaults). #4151.
+			local.args.$argsResolved = true;
 			arguments.href = uRLFor(argumentCollection = local.args);
 			local.encodeExcept = "href";
 		} else if (IsBoolean(arguments.sanitizeHref) && arguments.sanitizeHref) {
@@ -160,6 +164,7 @@ component {
 	 * @protocol [see:URLFor].
 	 * @port [see:URLFor].
 	 * @encode [see:styleSheetLinkTag].
+	 * @authenticityToken [see:startFormTag].
 	 */
 	public string function buttonTo(
 		string text,
@@ -175,10 +180,20 @@ component {
 		string host,
 		string protocol,
 		numeric port,
-		any encode
+		any encode,
+		boolean authenticityToken = true
 	) {
 		local.method = "post";
 		$args(name = "buttonTo", args = arguments);
+		// authenticityToken = false leaves the hidden token field out (#3959). Use it for
+		// every form in cached markup that other visitors receive: a stored field would
+		// hand them the token of the session that warmed the cache. The token then comes
+		// at request time, in the X-CSRF-Token header (Turbo sends it from
+		// csrfMetaTags(); a fetch() must set it) or via a script that copies the meta tag
+		// into the form on submit. Removed from arguments so it never reaches URLFor()
+		// or the element's attributes.
+		local.includeToken = arguments.authenticityToken;
+		StructDelete(arguments, "authenticityToken");
 		local.content = "";
 		if (StructKeyExists(arguments, "method")) {
 			if (!ListFindNoCase("post,get", arguments.method)) {
@@ -218,7 +233,7 @@ component {
 		// `_method` field added above.
 		arguments.method = local.method;
 		local.encode = $coerceEncode(arguments.encode, "attributes");
-		if ($isRequestProtectedFromForgery() && ListFindNoCase("post,put,patch,delete", arguments.method)) {
+		if ($isRequestProtectedFromForgery() && ListFindNoCase("post,put,patch,delete", arguments.method) && local.includeToken) {
 			local.content &= authenticityTokenField();
 		}
 		return $element(

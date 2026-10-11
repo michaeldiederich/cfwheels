@@ -13,34 +13,40 @@ component extends="wheels.WheelsTest" {
 	 * Sizes and growth bound for the binding-linearity specs. `large` is
 	 * `factor` times `small`. A linear binder's time grows about `factor` times
 	 * between them; a quadratic one grows faster. The small size is chosen so
-	 * the small call takes well over 10ms on Lucee 7, above the ~1ms timer
-	 * resolution, so taking the fastest run does not inflate the growth.
-	 * Lucee 7 measurements with factor 10 (fastest of three runs):
-	 *   current binder              plain 9.6-10.1x, run of quotes 9.1-10.9x
-	 *                               (small call 26-28ms)
-	 *   scanner that copies the rest of the string for every character
-	 *   (quadratic)                 plain 40-42x, run of quotes 41-50x
-	 * so 25 leaves more than 2x headroom above a linear binder and still
-	 * fails a quadratic one.
+	 * the small call takes well over 10ms, above the ~1ms timer resolution, so
+	 * taking the fastest run does not inflate the growth. With factor 10, 25
+	 * leaves more than 2x headroom above a linear binder and still fails a
+	 * quadratic one (a scanner that copies the rest of the string for every
+	 * character measured 40-50x).
 	 *
-	 * RustCFML and BoxLang: the WHERE literal scanner is super-linear on these
-	 * engines whatever the framework does. On RustCFML Mid() costs O(index) (it
-	 * walks the string to reach a character), so the scan is quadratic (about
-	 * 70x for factor 10). BoxLang measured 29-42x for factor 10 in CI. These
-	 * engines get a "no worse than quadratic" bound instead: a quadratic
-	 * binder grows about 100x for factor 10, and 250 adds 2.5x for timer and
-	 * machine noise. That is not "anything goes": a cubic or backtracking
-	 * regression grows 1000x or more and still fails. The sizes are smaller to
-	 * keep the run short. Tightening this is tracked separately.
+	 * The WHERE literal scanner reads the string into a one-pass char array and
+	 * walks it with O(1) indexing (#3903), so a plain value is cheap. Measured with
+	 * factor 10 (fastest of three runs): Lucee 7 plain 8.3x, run of quotes 9.9x, IN
+	 * list 10.1x; Adobe 2023 9.6x, 10.2x, 10.3x; BoxLang 8.5x, 4.6x, 10.7x. The IN
+	 * list kind counts values, not characters.
+	 *
+	 * RustCFML: Mid() and Find() cost O(index) there (they walk the string to reach
+	 * a position), which made the old per-index scan O(n^2) for a value with a
+	 * boundary every few characters. Two more RustCFML O(n) primitives were found and
+	 * avoided in the rewrite: java.lang.StringBuilder.append is O(length) (so the
+	 * output and value are built in CFML arrays, ArrayAppend O(1), joined once) and
+	 * ArraySlice is O(start) (so spans are not sliced). With all three avoided the
+	 * masker is linear on RustCFML: measured plain 11.5x, doubled quotes 10.8x, IN
+	 * list 11.8x — so every kind holds the same 25x bound as the JVM engines. RustCFML
+	 * sizes are larger than the first cut so the small run clears timer noise under the
+	 * tightened bound, but smaller than the JVM sizes to keep the lane short.
 	 */
 	private struct function linearityPlan(required string kind) {
 		var adapter = application.wheels.engineAdapter;
-		var superLinear = adapter.isRustCFML() || adapter.isBoxLang();
-		var plan = {factor = 10, maxGrowth = superLinear ? 250 : 25};
+		var isRustCFML = adapter.isRustCFML();
+		var plan = {factor = 10, maxGrowth = 25};
 		if (arguments.kind == "plain") {
-			plan.small = superLinear ? 3000 : 50000;
+			plan.small = isRustCFML ? 8000 : 200000;
+		} else if (arguments.kind == "inList") {
+			plan.small = isRustCFML ? 600 : 2000;
 		} else {
-			plan.small = superLinear ? 1500 : 30000;
+			plan.small = isRustCFML ? 5000 : 30000;
+			plan.maxGrowth = 25;
 		}
 		plan.large = plan.small * plan.factor;
 		return plan;
@@ -51,16 +57,32 @@ component extends="wheels.WheelsTest" {
 	// queries. No query is executed, so the time measures the binder only and
 	// does not depend on the database (Oracle, for one, refuses to bind a string
 	// over 4000 characters). The quotes value is escaped the way a dynamic finder
-	// escapes it, so `size` quote characters become 2 * `size` in the string.
+	// escapes it, so `size` quote characters become 2 * `size` in the string. For
+	// `inList`, `size` is the number of values in an IN list shaped the way
+	// whereIn() writes it, each value bound as its own parameter.
 	private numeric function bindingTime(required string kind, required numeric size) {
 		var author = model("author");
-		var whereString = arguments.kind == "plain"
-			? "lastName = '" & RepeatString("z", arguments.size) & "'"
-			: "firstName = '" & RepeatString("''", arguments.size) & "'";
+		var whereString = "";
+		if (arguments.kind == "plain") {
+			whereString = "lastName = '" & RepeatString("z", arguments.size) & "'";
+		} else if (arguments.kind == "inList") {
+			whereString = "firstName IN (" & inListValues(arguments.size) & ")";
+		} else {
+			whereString = "firstName = '" & RepeatString("''", arguments.size) & "'";
+		}
 		var t0 = GetTickCount();
 		var sqlParts = author.$addWhereClause(sql = ["SELECT 1"], where = whereString, include = "", includeSoftDeletes = false);
 		author.$addWhereClauseParameters(sql = sqlParts, where = whereString);
 		return GetTickCount() - t0;
+	}
+
+	// "'v1','v2',...,'v<count>'", the quoted list whereIn() builds for string values.
+	private string function inListValues(required numeric count) {
+		var parts = [];
+		for (var i = 1; i <= arguments.count; i++) {
+			ArrayAppend(parts, "'v#i#'");
+		}
+		return ArrayToList(parts);
 	}
 
 	// Fastest of three runs at each size (the caller has already warmed the
@@ -83,7 +105,8 @@ component extends="wheels.WheelsTest" {
 			rv[sizeKey] = best;
 		}
 		rv.growth = Round(rv.large / Max(rv.small, 1) * 10) / 10;
-		rv.summary = "#arguments.plan.small# chars took #rv.small#ms, #arguments.plan.large# chars took #rv.large#ms, growth #rv.growth#x (limit #arguments.plan.maxGrowth#x)";
+		var unit = arguments.kind == "inList" ? "values" : "chars";
+		rv.summary = "#arguments.plan.small# #unit# took #rv.small#ms, #arguments.plan.large# #unit# took #rv.large#ms, growth #rv.growth#x (limit #arguments.plan.maxGrowth#x)";
 		return rv;
 	}
 
@@ -311,7 +334,7 @@ component extends="wheels.WheelsTest" {
 				expect(ib.threw).toBe("Wheels.InvalidValue", "type=#ib.threw#");
 			});
 
-			it("binds a large IN list (a batch of keys) quickly instead of crashing", () => {
+			it("binds a large IN list (a batch of keys) in linear time instead of crashing", () => {
 				// Each IN value binds as its own parameter, and SQL Server accepts at
 				// most 2100 parameters per statement, so it gets a batch under that
 				// limit. Every other database takes the full 6000.
@@ -320,11 +343,14 @@ component extends="wheels.WheelsTest" {
 				for (var i = 1; i <= batchSize; i++) {
 					ArrayAppend(values, "v#i#");
 				}
-				var t0 = GetTickCount();
 				var q = model("author").whereIn("firstName", values).get();
-				var elapsed = GetTickCount() - t0;
 				expect(q.recordCount).toBe(0, "returned #q.recordCount# rows");
-				expect(elapsed).toBeLT(5000, "took #elapsed#ms");
+				// Growth between two list sizes, not a wall-clock budget: see linearityPlan().
+				var plan = linearityPlan("inList");
+				bindingTime("inList", plan.large);
+				var ratio = bindingGrowth("inList", plan);
+				debug(var = "IN list: #ratio.summary#", label = "binding linearity");
+				expect(ratio.growth).toBeLT(plan.maxGrowth, "IN list: #ratio.summary#");
 			});
 
 			it("binds a batch of 1000 UUID keys without a cap", () => {

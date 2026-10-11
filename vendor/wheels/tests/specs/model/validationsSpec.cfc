@@ -387,6 +387,169 @@ component extends="wheels.WheelsTest" {
 				expect(callValid).toThrow("Wheels.InvalidValidationCondition")
 			})
 
+			// Bare names resolve as this.<name> when the key exists; anything else that
+			// is not a reference or a full "a op b" comparison throws (#3928). Before,
+			// these evaluated to false silently, which skipped the validation.
+			it("runs a rule whose bare-name condition is a true property, and skips it when false", () => {
+				user.isActive = true
+				expect(user.$evaluateCondition(condition = "isActive")).toBeTrue()
+				user.isActive = false
+				expect(user.$evaluateCondition(condition = "isActive")).toBeFalse()
+			})
+
+			it("inverts a bare-name unless", () => {
+				user.isActive = true
+				expect(user.$evaluateCondition(unless = "isActive")).toBeFalse()
+				user.isActive = false
+				expect(user.$evaluateCondition(unless = "isActive")).toBeTrue()
+			})
+
+			it("calls a bare-name method", () => {
+				expect(user.$evaluateCondition(condition = "isNew")).toBe(user.isNew())
+			})
+
+			it("fails closed for a bare name that is not a property or method", () => {
+				args.condition = "noSuchName"
+				user.validatesLengthOf(argumentCollection = args)
+				var callValid = () => {
+					user.valid()
+				}
+				expect(callValid).toThrow("Wheels.InvalidValidationCondition")
+			})
+
+			it("fails closed for a bare-name unless that is not a property or method", () => {
+				args.unless = "noSuchName"
+				user.validatesLengthOf(argumentCollection = args)
+				var callValid = () => {
+					user.valid()
+				}
+				expect(callValid).toThrow("Wheels.InvalidValidationCondition")
+			})
+
+			it("resolves a bare left operand: the guide's status != 'draft' skips a draft", () => {
+				user.status = "draft"
+				expect(user.$evaluateCondition(condition = "status != 'draft'")).toBeFalse()
+				user.status = "published"
+				expect(user.$evaluateCondition(condition = "status != 'draft'")).toBeTrue()
+			})
+
+			it("treats a bare right-hand word as a string literal, with or without this. on the left", () => {
+				user.status = "draft"
+				expect(user.$evaluateConditionString("status neq draft")).toBeFalse()
+				expect(user.$evaluateConditionString("this.status neq draft")).toBeFalse()
+				user.status = "published"
+				expect(user.$evaluateConditionString("status neq draft")).toBeTrue()
+				expect(user.$evaluateConditionString("this.status neq draft")).toBeTrue()
+			})
+
+			it("fails closed for a bare left operand that is not a property", () => {
+				var callBare = () => {
+					user.$evaluateConditionString("noSuchName neq 'draft'")
+				}
+				expect(callBare).toThrow()
+			})
+
+			it("fails closed for an incomplete comparison", () => {
+				var callShort = () => {
+					user.$evaluateConditionString("1 eq")
+				}
+				expect(callShort).toThrow()
+			})
+
+			it("fails closed for a comparison with trailing tokens", () => {
+				var callLong = () => {
+					user.$evaluateConditionString("1 eq 1 2")
+				}
+				expect(callLong).toThrow()
+			})
+
+			it("fails closed for a this. reference on the right of a comparison", () => {
+				var callRight = () => {
+					user.$evaluateConditionString("'weekly' eq this.frequency")
+				}
+				expect(callRight).toThrow()
+			})
+
+			it("fails closed for a this. reference on the right of a this.-left comparison (##3964)", () => {
+				user.total = 50
+				user.limit = 10
+				var callRightThis = () => {
+					user.$evaluateConditionString("this.total gt this.limit")
+				}
+				expect(callRightThis).toThrow()
+			})
+
+			it("fails closed for the word-form `is` operator on the this. path (##3964)", () => {
+				user.status = "draft"
+				var callIs = () => {
+					user.$evaluateConditionString("this.status is 'draft'")
+				}
+				expect(callIs).toThrow()
+			})
+
+			it("fails closed for word-form `and` on the this. path (##3964)", () => {
+				user.kind = "b2b"
+				user.country = "SE"
+				var callAnd = () => {
+					user.$evaluateConditionString("this.kind eq 'b2b' and this.country eq 'SE'")
+				}
+				expect(callAnd).toThrow()
+			})
+
+			it("fails closed for word-form `or` on the this. path (##3964)", () => {
+				user.kind = "b2c"
+				user.country = "SE"
+				var callOr = () => {
+					user.$evaluateConditionString("this.kind eq 'b2b' or this.country eq 'SE'")
+				}
+				expect(callOr).toThrow()
+			})
+
+			it("still accepts a quoted literal containing is/and/or words (##3964)", () => {
+				user.motto = "slow is smooth and smooth is fast or so they say"
+				expect(user.$evaluateConditionString("this.motto eq 'slow is smooth and smooth is fast or so they say'")).toBeTrue()
+			})
+
+			it("fails closed for UPPERCASE word-form operators too (##3964)", () => {
+				// The guard relies on CFML `==` being case-insensitive inside
+				// $splitTopLevelCondition; pin it so a switch to a case-sensitive
+				// compare cannot silently let `AND`/`OR`/`IS` through.
+				user.kind = "b2b"
+				user.country = "SE"
+				user.status = "draft"
+				var callUAnd = () => {
+					user.$evaluateConditionString("this.kind eq 'b2b' AND this.country eq 'SE'")
+				}
+				var callUOr = () => {
+					user.$evaluateConditionString("this.kind eq 'b2b' OR this.country eq 'SE'")
+				}
+				var callUIs = () => {
+					user.$evaluateConditionString("this.status IS 'draft'")
+				}
+				expect(callUAnd).toThrow()
+				expect(callUOr).toThrow()
+				expect(callUIs).toThrow()
+			})
+
+			it("evaluates the guide's this.status != 'draft' example", () => {
+				user.status = "draft"
+				expect(user.$evaluateConditionString("this.status != 'draft'")).toBeFalse()
+				user.status = "published"
+				expect(user.$evaluateConditionString("this.status != 'draft'")).toBeTrue()
+			})
+
+			it("evaluates a lone boolean literal as its value", () => {
+				expect(user.$evaluateConditionString("true")).toBeTrue()
+				expect(user.$evaluateConditionString("false")).toBeFalse()
+			})
+
+			it("still evaluates literal comparisons of numbers, quoted strings and booleans", () => {
+				expect(user.$evaluateConditionString("1 eq 1")).toBeTrue()
+				expect(user.$evaluateConditionString("5 gt 3")).toBeTrue()
+				expect(user.$evaluateConditionString("'a' eq 'b'")).toBeFalse()
+				expect(user.$evaluateConditionString("true eq true")).toBeTrue()
+			})
+
 			it("runs a validation whose compound condition is true (##3634)", () => {
 				user.requestFor = "Engine Part"
 				args.condition = "StructKeyExists(this, 'requestFor') && this.requestFor eq 'Engine Part'"

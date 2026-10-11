@@ -24,25 +24,100 @@
 		// make all cache keys domain specific (do not use request scope below since it may not always be initialized)
 		StructInsert(arguments, ListLen(StructKeyList(arguments)) + 1, cgi.http_host, true);
 
-		// we need to make sure we are looping through the passed in arguments in the same order everytime
-		local.values = [];
-		local.keyList = ListSort(StructKeyList(arguments), "textnocase", "asc");
-		local.keyArray = ListToArray(local.keyList);
-		local.iEnd = ArrayLen(local.keyArray);
-		for (local.i = 1; local.i <= local.iEnd; local.i++) {
-			ArrayAppend(local.values, arguments[local.keyArray[local.i]]);
-		}
-
-		if (!ArrayIsEmpty(local.values)) {
-			// this might fail if a query contains binary data so in those rare cases we fall back on using cfwddx (which is a little bit slower which is why we don't use it all the time)
-			try {
-				local.rv = SerializeJSON(local.values);
-				local.rv = $engineAdapter().normalizeForHash(local.rv);
-			} catch (any e) {
-				local.rv = $wddx(input = local.values);
+		// Build a tagged, order-preserving structure (struct keys sorted, argument names, array elements
+		// and query rows kept in order) and serialize it once, so the key ignores struct key order only.
+		local.keyArray = ListToArray(ListSort(StructKeyList(arguments), "textnocase", "asc"));
+		try {
+			local.rv = SerializeJSON($canonicalCacheStruct(arguments, local.keyArray, 0));
+		} catch (any e) {
+			// values the canonical encoder cannot represent (e.g. driver-specific Java objects) fall back on cfwddx
+			local.values = [];
+			local.iEnd = ArrayLen(local.keyArray);
+			for (local.i = 1; local.i <= local.iEnd; local.i++) {
+				if (StructKeyExists(arguments, local.keyArray[local.i])) {
+					ArrayAppend(local.values, arguments[local.keyArray[local.i]]);
+				}
 			}
+			local.rv = $wddx(input = local.values);
 		}
 		return Hash(local.rv);
+	}
+
+	/**
+	 * Internal function.
+	 * Canonical form of a struct (or the arguments scope) for `$hashedKey()`: a "t"-tagged array of
+	 * lower-cased key / value pairs in the given key order. Simple values are inlined; complex values
+	 * become tagged arrays, and an undefined value becomes an empty array, so the forms cannot collide.
+	 */
+	public array function $canonicalCacheStruct(required any container, required array keys, numeric depth = 0) {
+		local.rv = ["t"];
+		local.iEnd = ArrayLen(arguments.keys);
+		for (local.i = 1; local.i <= local.iEnd; local.i++) {
+			local.key = arguments.keys[local.i];
+			ArrayAppend(local.rv, LCase(local.key));
+			if (!StructKeyExists(arguments.container, local.key)) {
+				ArrayAppend(local.rv, []);
+			} else if (IsSimpleValue(arguments.container[local.key])) {
+				ArrayAppend(local.rv, arguments.container[local.key]);
+			} else {
+				ArrayAppend(local.rv, $canonicalCacheValue(arguments.container[local.key], arguments.depth + 1));
+			}
+		}
+		return local.rv;
+	}
+
+	/**
+	 * Internal function.
+	 * Canonical form of a value for `$hashedKey()`. Struct keys are sorted (their engine iteration order
+	 * is not stable), while array elements and query rows keep their position. Queries are embedded as-is
+	 * and serialized natively, which preserves row and cell order.
+	 */
+	public any function $canonicalCacheValue(any value, numeric depth = 0) {
+		// `value` is optional because some engines report a declared-but-unpassed argument as a key
+		// holding null, which then arrives here as a missing argument
+		if (!StructKeyExists(arguments, "value") || IsNull(arguments.value)) {
+			return [];
+		}
+		if (arguments.depth > 64) {
+			Throw(type = "Wheels.CacheKeyTooDeep", message = "Value is nested too deeply to build a cache key.");
+		}
+		if (IsBinary(arguments.value)) {
+			return ["x", Hash(ToBase64(arguments.value))];
+		}
+		if (IsSimpleValue(arguments.value)) {
+			return arguments.value;
+		}
+		if (IsQuery(arguments.value)) {
+			return ["q", arguments.value];
+		}
+		if (IsArray(arguments.value)) {
+			local.rv = ["a"];
+			local.iEnd = ArrayLen(arguments.value);
+			for (local.i = 1; local.i <= local.iEnd; local.i++) {
+				if (!ArrayIsDefined(arguments.value, local.i)) {
+					ArrayAppend(local.rv, []);
+				} else if (IsSimpleValue(arguments.value[local.i])) {
+					ArrayAppend(local.rv, arguments.value[local.i]);
+				} else {
+					ArrayAppend(local.rv, $canonicalCacheValue(arguments.value[local.i], arguments.depth + 1));
+				}
+			}
+			return local.rv;
+		}
+		if (IsObject(arguments.value)) {
+			// model objects are keyed on their class and current property values
+			if (StructKeyExists(arguments.value, "$classData") && StructKeyExists(arguments.value, "properties")) {
+				local.object = arguments.value;
+				return ["m", local.object.$classData().modelName, $canonicalCacheValue(local.object.properties(), arguments.depth + 1)];
+			}
+			return ["o", SerializeJSON(arguments.value)];
+		}
+		if (IsStruct(arguments.value)) {
+			local.keys = StructKeyArray(arguments.value);
+			ArraySort(local.keys, "textnocase");
+			return $canonicalCacheStruct(arguments.value, local.keys, arguments.depth + 1);
+		}
+		return ["o", SerializeJSON(arguments.value)];
 	}
 
 	/**
@@ -122,14 +197,15 @@
 
 
 	/**
-	 * Internal function.
+	 * Internal function. Returns `true` when the value was stored, `false` when the cache was full.
 	 */
-	public void function $addToCache(
+	public boolean function $addToCache(
 		required string key,
 		required any value,
 		numeric time = application.wheels.defaultCacheTime,
 		string category = "main"
 	) {
+		local.stored = false;
 		lock name="#application.applicationName#wheelsCacheStore" type="exclusive" timeout="30" {
 		local.storeKey = arguments.key;
 		if (arguments.category == "action") {
@@ -138,7 +214,7 @@
 		local.currentCount = $cacheCount();
 		if (
 			application.wheels.cacheCullPercentage > 0
-			&& application.wheels.cacheLastCulledAt < DateAdd("n", -application.wheels.cacheCullInterval, Now())
+			&& application.wheels.cacheLastCulledAt < DateAdd("n", -application.wheels.cacheCullInterval, $now())
 			&& local.currentCount >= application.wheels.maximumItemsToCache
 		) {
 			// the cache is full so flush out expired items to make more room if possible
@@ -150,7 +226,7 @@
 			} else {
 				local.maxItemsToDelete = local.currentCount;
 			}
-			local.now = Now();
+			local.now = $now();
 			local.categories = StructKeyArray(application.wheels.cache);
 			local.iEnd = ArrayLen(local.categories);
 			for (local.i = 1; local.i <= local.iEnd && local.deletedItems < local.maxItemsToDelete; local.i++) {
@@ -170,17 +246,18 @@
 				}
 			}
 			local.currentCount -= local.deletedItems;
-			application.wheels.cacheLastCulledAt = Now();
+			application.wheels.cacheLastCulledAt = $now();
 		}
 		if (local.currentCount < application.wheels.maximumItemsToCache) {
 			local.cacheItem = {};
-			local.cacheItem.expiresAt = DateAdd(application.wheels.cacheDatePart, arguments.time, Now());
+			local.cacheItem.expiresAt = DateAdd(application.wheels.cacheDatePart, arguments.time, $now());
 			if (IsSimpleValue(arguments.value)) {
 				local.cacheItem.value = arguments.value;
 			} else {
 				local.cacheItem.value = Duplicate(arguments.value);
 			}
 			application.wheels.cache[arguments.category][local.storeKey] = local.cacheItem;
+			local.stored = true;
 			if (arguments.category == "action" && StructKeyExists(variables, "$class") && StructKeyExists(variables.$class, "name")) {
 				if (!StructKeyExists(application.wheels, "cacheActionIndex")) {
 					application.wheels.cacheActionIndex = {};
@@ -200,6 +277,7 @@
 			}
 		}
 		}
+		return local.stored;
 	}
 
 
@@ -216,7 +294,7 @@
 					local.storeKey = $actionCacheKey(arguments.key);
 				}
 				if (StructKeyExists(application.wheels.cache[arguments.category], local.storeKey)) {
-					if (Now() > application.wheels.cache[arguments.category][local.storeKey].expiresAt) {
+					if ($now() > application.wheels.cache[arguments.category][local.storeKey].expiresAt) {
 						$removeFromCache(key = local.storeKey, category = arguments.category);
 					} else {
 						if (IsSimpleValue(application.wheels.cache[arguments.category][local.storeKey].value)) {
@@ -291,5 +369,242 @@
 				StructClear(application.wheels.cache[local.cacheCategory]);
 			}
 		}
+	}
+
+
+	// ======================================================================
+	// APPLICATION DATA CACHE (public)
+	// ======================================================================
+
+	/**
+	 * Returns the value cached under `key`. On a miss, calls `callback`, caches what it returns for `time`
+	 * and returns it. A cached `false`, `0` or `""` counts as a hit, so `callback` isn't called again
+	 * until the entry expires or is deleted. When `callback` returns nothing, nothing is cached and `""`
+	 * is returned; when it throws, nothing is cached and the error propagates. `callback` runs outside
+	 * the cache lock, so two requests that miss at the same moment may both call it (the later write
+	 * wins). When the cache is full, the computed value is returned but not cached, so the next call
+	 * computes it again. The cache lives in this server's memory and empties on an application reload
+	 * or restart.
+	 *
+	 * Keys are shared by every user, session, tenant and host: nothing about the request is added. For
+	 * per-user, per-role or per-tenant data, put that identity in the key, e.g. `"digest-" & userId`.
+	 *
+	 * [section: Global Helpers]
+	 * [category: Caching Functions]
+	 *
+	 * @key A string, or a struct or array of values (struct key order doesn't matter).
+	 * @callback A function that computes the value.
+	 * @time How long to keep the value, in `cacheDatePart` units (minutes by default).
+	 */
+	public any function appCacheFetch(
+		required any key,
+		required any callback,
+		numeric time = application.wheels.defaultCacheTime
+	) {
+		local.storeKey = $appCacheKey(arguments.key);
+		local.value = $getFromCache(key = local.storeKey, category = $appCacheCategory());
+		if (!$isCacheMiss()) {
+			return local.value;
+		}
+		local.fn = arguments.callback;
+		local.result = local.fn();
+		if (!StructKeyExists(local, "result")) {
+			return "";
+		}
+		$addToCache(key = local.storeKey, value = local.result, time = arguments.time, category = $appCacheCategory());
+		return local.result;
+	}
+
+	/**
+	 * Returns the value cached under `key`, or `defaultValue` when there is no unexpired entry. A cached
+	 * `false`, `0` or `""` is returned as it is. Complex values come back as a copy.
+	 * Keys are shared by every user, session, tenant and host (see `appCacheFetch()`).
+	 *
+	 * [section: Global Helpers]
+	 * [category: Caching Functions]
+	 *
+	 * @key A string, or a struct or array of values (struct key order doesn't matter).
+	 * @defaultValue What to return on a miss. The named argument `default` is also accepted.
+	 */
+	public any function appCacheRead(required any key, any defaultValue = "") {
+		local.value = $getFromCache(key = $appCacheKey(arguments.key), category = $appCacheCategory());
+		if (!$isCacheMiss()) {
+			return local.value;
+		}
+		// `default` is a reserved word Adobe CF won't bind as a parameter name, but a named argument
+		// still arrives under its literal key on every engine.
+		if (StructKeyExists(arguments, "default")) {
+			return arguments.default;
+		}
+		return arguments.defaultValue;
+	}
+
+	/**
+	 * Caches `value` under `key` for `time`, replacing any entry already there. Complex values are
+	 * stored as a copy. Returns `false` when the value wasn't stored because the cache is full
+	 * (`maximumItemsToCache`).
+	 *
+	 * [section: Global Helpers]
+	 * [category: Caching Functions]
+	 *
+	 * @key A string, or a struct or array of values (struct key order doesn't matter).
+	 * @value The value to cache.
+	 * @time How long to keep the value, in `cacheDatePart` units (minutes by default).
+	 */
+	public boolean function appCacheWrite(
+		required any key,
+		required any value,
+		numeric time = application.wheels.defaultCacheTime
+	) {
+		return $addToCache(
+			key = $appCacheKey(arguments.key),
+			value = arguments.value,
+			time = arguments.time,
+			category = $appCacheCategory()
+		);
+	}
+
+	/**
+	 * Returns `true` when an unexpired entry exists for `key`, even one holding `false`, `0` or `""`.
+	 *
+	 * [section: Global Helpers]
+	 * [category: Caching Functions]
+	 *
+	 * @key A string, or a struct or array of values (struct key order doesn't matter).
+	 */
+	public boolean function appCacheExists(required any key) {
+		local.storeKey = $appCacheKey(arguments.key);
+		local.category = $appCacheCategory();
+		lock name="#application.applicationName#wheelsCacheStore" type="readonly" timeout="30" {
+			local.rv = StructKeyExists(application.wheels.cache[local.category], local.storeKey)
+				&& Now() <= application.wheels.cache[local.category][local.storeKey].expiresAt;
+		}
+		return local.rv;
+	}
+
+	/**
+	 * Removes the entry for `key`. Returns `true` when there was an unexpired entry to remove.
+	 *
+	 * [section: Global Helpers]
+	 * [category: Caching Functions]
+	 *
+	 * @key A string, or a struct or array of values (struct key order doesn't matter).
+	 */
+	public boolean function appCacheDelete(required any key) {
+		local.storeKey = $appCacheKey(arguments.key);
+		local.category = $appCacheCategory();
+		lock name="#application.applicationName#wheelsCacheStore" type="exclusive" timeout="30" {
+			local.rv = StructKeyExists(application.wheels.cache[local.category], local.storeKey)
+				&& Now() <= application.wheels.cache[local.category][local.storeKey].expiresAt;
+			StructDelete(application.wheels.cache[local.category], local.storeKey);
+		}
+		return local.rv;
+	}
+
+	/**
+	 * Removes every entry from the application data cache. The framework's own caches (actions, pages,
+	 * partials, queries) are left alone.
+	 *
+	 * [section: Global Helpers]
+	 * [category: Caching Functions]
+	 */
+	public void function appCacheClear() {
+		$clearCache(category = $appCacheCategory());
+	}
+
+	/**
+	 * Internal function. The `application.wheels.cache` category the application data cache uses,
+	 * created here when the running application started before it existed.
+	 */
+	public string function $appCacheCategory() {
+		if (!StructKeyExists(application.wheels.cache, "data")) {
+			lock name="#application.applicationName#wheelsCacheStore" type="exclusive" timeout="30" {
+				if (!StructKeyExists(application.wheels.cache, "data")) {
+					application.wheels.cache.data = {};
+				}
+			}
+		}
+		return "data";
+	}
+
+	/**
+	 * Internal function. The store key for an application data cache key. A string is hashed as it is, so
+	 * keys stay case-sensitive even though the cache struct isn't; anything else is hashed from its
+	 * canonical form, so struct key order doesn't matter. Unlike `$hashedKey()`, the host name isn't part
+	 * of it, so a job and a request share entries.
+	 */
+	public string function $appCacheKey(required any key) {
+		if (IsSimpleValue(arguments.key)) {
+			return "s:" & Hash(arguments.key, "SHA-256");
+		}
+		return "c:" & Hash(SerializeJSON($canonicalCacheValue(value = arguments.key)), "SHA-256");
+	}
+
+	/**
+	 * Clears the per-request finder cache that `cacheQueriesDuringRequest` fills, namespaced under the
+	 * reserved `request.wheels["$queryCache"]` key. Use this instead of reaching into that internal key.
+	 *
+	 *   model("Post").forgetCachedQueries()   clears just the Post model's slot (chainable — returns the model)
+	 *   forgetCachedQueries("Post")           clears just the Post model's slot, by name (works anywhere)
+	 *   forgetCachedQueries(all = true)        clears every model's cached results this request
+	 *
+	 * This is only needed after RAW writes (`queryExecute(...)`) — ORM writes (create / update / delete
+	 * and the `*All` / `*ByKey` forms) already clear the whole request cache themselves (#4429). After a
+	 * raw write, prefer `all = true` when the tables you wrote are joined by other models' `include=`
+	 * queries: a cross-model result is cached in the *base* model's slot, so the single-model named form
+	 * misses it. The named form is for a raw single-table write whose table no other cached query joins.
+	 *
+	 * Called as a method on a model instance it scopes to that model automatically, because only a model
+	 * carries `variables.wheels.class.modelName` (Controller / view / job / base Global do not). Called
+	 * outside a model with neither a `modelName` nor `all`, it throws rather than silently wiping every
+	 * model's cache — clearing everything has to be asked for explicitly.
+	 *
+	 * This is a single global helper on purpose: it cannot also be declared on the model, because Adobe CF
+	 * forbids the same UDF name in both the Global mixin and a model fragment (both compile into the model
+	 * component). A no-op when nothing has been cached yet.
+	 *
+	 * As with every global helper, `forgetCachedQueries` is a reserved controller action name — a controller
+	 * cannot define an action called `forgetCachedQueries` (it is on the protected-method surface).
+	 *
+	 * [section: Miscellaneous Functions]
+	 * [category: General Functions]
+	 *
+	 * @modelName Clear only this model's slot. Defaults to the calling model's own name when invoked as
+	 *   `model("X").forgetCachedQueries()`.
+	 * @all Clear every model's cached queries for the request. Required (true) to wipe everything from
+	 *   outside a model.
+	 */
+	public any function forgetCachedQueries(string modelName = "", boolean all = false) {
+		// The cache is keyed by the model's bare name, ListLast(name, "/") (Model.cfc), so a namespaced
+		// argument like "admin/User" must be normalised the same way to hit its slot. The auto-scope path
+		// below already reads variables.wheels.class.modelName, which is stored normalised.
+		local.slot = ListLast(arguments.modelName, "/");
+		if (
+			!Len(local.slot)
+			&& StructKeyExists(variables, "wheels")
+			&& StructKeyExists(variables.wheels, "class")
+			&& IsStruct(variables.wheels.class)
+			&& StructKeyExists(variables.wheels.class, "modelName")
+		) {
+			local.slot = variables.wheels.class.modelName;
+		}
+
+		if (!arguments.all && !Len(local.slot)) {
+			Throw(
+				type = "Wheels.InvalidArgument",
+				message = "forgetCachedQueries() needs a model to clear, or all = true.",
+				detail = "Call it on a model (model(""Post"").forgetCachedQueries()), name a model (forgetCachedQueries(""Post"")), or pass all = true to clear every model's cached queries for this request."
+			);
+		}
+
+		if (StructKeyExists(request, "wheels") && StructKeyExists(request.wheels, "$queryCache")) {
+			if (arguments.all) {
+				StructDelete(request.wheels, "$queryCache");
+			} else {
+				// Empty just this model's slot, keeping the key, so a re-query repopulates it in place.
+				request.wheels["$queryCache"][local.slot] = {};
+			}
+		}
+		return this;
 	}
 </cfscript>

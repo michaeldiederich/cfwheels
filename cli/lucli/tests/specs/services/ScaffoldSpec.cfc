@@ -94,14 +94,15 @@ component extends="wheels.wheelstest.system.BaseSpec" {
 					expect(content).toInclude('filters(through="requireRecord", only="show,edit,update,delete")');
 					expect(content).toInclude("private function requireRecord()");
 					expect(content).toInclude('IsObject(model("Notefile").findByKey(key=params.key))');
-					expect(content).toInclude('type = "Wheels.RecordNotFound"');
 
 					// The 404 must hold in production too. A bare Throw() only
 					// becomes a 404 on the development error page; production
-					// serves the generic 500. $throwErrorOrShow404Page() sets 404
-					// and throws (development) or renders onmissingtemplate.cfm
-					// (production).
-					expect(content).toInclude("$throwErrorOrShow404Page(");
+					// serves the generic 500. renderNotFound() (the public helper,
+					// #3900) sets 404 and throws Wheels.RecordNotFound (development)
+					// or renders onmissingtemplate.cfm (production); the scaffold no
+					// longer depends on the internal $throwErrorOrShow404Page.
+					expect(content).toInclude("renderNotFound(");
+					expect(content).notToInclude("$throwErrorOrShow404Page(");
 					expect(content).notToInclude("Throw(");
 
 					// The guard must NOT live inside show(): ScaffoldSource only
@@ -138,7 +139,7 @@ component extends="wheels.wheelstest.system.BaseSpec" {
 					var guard = Mid(content, guardAt, Len(content));
 					expect(guard).toInclude('"Wheels.InvalidValue"');
 					expect(guard).toInclude("rethrow;");
-					expect(guard).toInclude("$throwErrorOrShow404Page(");
+					expect(guard).toInclude("renderNotFound(");
 
 					var scanned = new cli.lucli.services.ScaffoldSource().scan(content);
 					expect(scanned.valid).toBeTrue(scanned.reason);
@@ -373,7 +374,7 @@ component extends="wheels.wheelstest.system.BaseSpec" {
 						properties = [{name: "title", type: "string"}]
 					);
 					var content = fileRead(path);
-					expect(content).toInclude("t.string(columnNames='title', allowNull=true, limit='255')");
+					expect(content).toInclude("t.string(columnNames='title', allowNull=false, limit='255')");
 				});
 
 				it("emits custom string limit from title:string{50}", () => {
@@ -382,7 +383,7 @@ component extends="wheels.wheelstest.system.BaseSpec" {
 						properties = [{name: "title", type: "string", limit: "50"}]
 					);
 					var content = fileRead(path);
-					expect(content).toInclude("t.string(columnNames='title', allowNull=true, limit='50')");
+					expect(content).toInclude("t.string(columnNames='title', allowNull=false, limit='50')");
 					expect(content).notToInclude("limit='255'");
 				});
 
@@ -392,7 +393,7 @@ component extends="wheels.wheelstest.system.BaseSpec" {
 						properties = [{name: "price", type: "decimal"}]
 					);
 					var content = fileRead(path);
-					expect(content).toInclude("t.decimal(columnNames='price', allowNull=true, precision='10', scale='2')");
+					expect(content).toInclude("t.decimal(columnNames='price', allowNull=false, precision='10', scale='2')");
 				});
 
 				it("emits custom decimal precision and scale from price:decimal{10,2}", () => {
@@ -401,7 +402,7 @@ component extends="wheels.wheelstest.system.BaseSpec" {
 						properties = [{name: "price", type: "decimal", precision: "10", scale: "2"}]
 					);
 					var content = fileRead(path);
-					expect(content).toInclude("t.decimal(columnNames='price', allowNull=true, precision='10', scale='2')");
+					expect(content).toInclude("t.decimal(columnNames='price', allowNull=false, precision='10', scale='2')");
 				});
 
 				it("emits custom decimal precision and scale from amount:decimal{12,4}", () => {
@@ -410,7 +411,7 @@ component extends="wheels.wheelstest.system.BaseSpec" {
 						properties = [{name: "amount", type: "decimal", precision: "12", scale: "4"}]
 					);
 					var content = fileRead(path);
-					expect(content).toInclude("t.decimal(columnNames='amount', allowNull=true, precision='12', scale='4')");
+					expect(content).toInclude("t.decimal(columnNames='amount', allowNull=false, precision='12', scale='4')");
 					expect(content).notToInclude("precision='10'");
 				});
 
@@ -424,9 +425,9 @@ component extends="wheels.wheelstest.system.BaseSpec" {
 						]
 					);
 					var content = fileRead(path);
-					expect(content).toInclude("t.integer(columnNames='count', allowNull=true, limit='8')");
-					expect(content).toInclude("t.text(columnNames='body', allowNull=true, limit='1000')");
-					expect(content).toInclude("t.binary(columnNames='payload', allowNull=true, limit='4096')");
+					expect(content).toInclude("t.integer(columnNames='count', allowNull=false, limit='8')");
+					expect(content).toInclude("t.text(columnNames='body', allowNull=false, limit='1000')");
+					expect(content).toInclude("t.binary(columnNames='payload', allowNull=false, limit='4096')");
 				});
 
 				it("emits default integer limit 11 when no brace modifier is present", () => {
@@ -435,7 +436,7 @@ component extends="wheels.wheelstest.system.BaseSpec" {
 						properties = [{name: "count", type: "integer"}]
 					);
 					var content = fileRead(path);
-					expect(content).toInclude("t.integer(columnNames='count', allowNull=true, limit='11')");
+					expect(content).toInclude("t.integer(columnNames='count', allowNull=false, limit='11')");
 				});
 
 			});
@@ -729,7 +730,7 @@ component extends="wheels.wheelstest.system.BaseSpec" {
 					);
 					expect(result.success).toBeTrue();
 					var content = fileRead(tempRoot & "/app/controllers/api/Memos.cfc");
-					expect(content).toInclude('findAll(include="author")');
+					expect(content).toInclude('findAll(returnAs="objects", include="author")');
 					expect(content).toInclude('findByKey(key=params.key, include="author")');
 					expect(content).notToInclude('findByKey(params.key, include=');
 				});

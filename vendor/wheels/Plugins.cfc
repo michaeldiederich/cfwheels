@@ -265,7 +265,7 @@ component output="false" extends="wheels.Global"{
 					$deprecated(
 						feature = "plugins:mixin-only:#local.pluginKey#",
 						message = local.warning,
-						docUrl = "https://guides.wheels.dev/v4-0-0/upgrading/3x-to-4x/"
+						docUrl = new wheels.GuidesLink().link("upgrading/3x-to-4x/")
 					);
 				}
 				if ($isVersionMismatch(local.compatVersion, local.wheelsVersion)) {
@@ -334,9 +334,10 @@ component output="false" extends="wheels.Global"{
 			} else {
 				// No plugin.json found — plugin uses legacy init()-based metadata extraction.
 				// Log an info-level suggestion so authors know about the new manifest option.
+				local.packagesGuide = new wheels.GuidesLink().link("digging-deeper/packages/");
 				WriteLog(
 					type = "information",
-					text = "[Wheels] Plugin '#local.plugin#' does not have a plugin.json manifest. Consider adding one for declarative metadata, dependency management, and middleware registration — or migrate the plugin to a package installed under vendor/. See: https://guides.wheels.dev/v4-0-0/digging-deeper/packages/"
+					text = "[Wheels] Plugin '#local.plugin#' does not have a plugin.json manifest. Consider adding one for declarative metadata, dependency management, and middleware registration — or migrate the plugin to a package installed under vendor/. See: #local.packagesGuide#"
 				);
 			}
 		}
@@ -731,7 +732,7 @@ component output="false" extends="wheels.Global"{
 			$deprecated(
 				feature = "plugins-directory",
 				message = "The plugins/ directory is deprecated as of Wheels 4.0 and will be removed in Wheels 5.0. Plugins found: #local.pluginList#. Migrate each one to a package installed under vendor/ (`wheels packages add <name>` for published packages).",
-				docUrl = "https://guides.wheels.dev/v4-0-0/digging-deeper/packages/"
+				docUrl = new wheels.GuidesLink().link("digging-deeper/packages/")
 			);
 		}
 	}
@@ -831,11 +832,6 @@ component output="false" extends="wheels.Global"{
 	}
 
 	/**
-	 * Invokes the onPluginLoad lifecycle hook if defined on the plugin.
-	 * Builds a context struct (not the application scope directly) to work
-	 * around Adobe CF's limitation on function members in the application scope.
-	 */
-	/**
 	 * Isolated hook context for onPluginLoad / onPluginActivate.
 	 * Never the live application scope and never a StructCopy of it
 	 * (sync-back would plant attacker keys). registerMiddleware writes
@@ -850,6 +846,11 @@ component output="false" extends="wheels.Global"{
 		return local.context;
 	}
 
+	/**
+	 * Invokes the onPluginLoad lifecycle hook if defined on the plugin.
+	 * Builds a context struct (not the application scope directly) to work
+	 * around Adobe CF's limitation on function members in the application scope.
+	 */
 	private void function $invokeOnPluginLoad(required string pluginKey, required any plugin) {
 		if (!StructKeyExists(arguments.plugin, "onPluginLoad") || !IsCustomFunction(arguments.plugin.onPluginLoad)) {
 			return;
@@ -1036,7 +1037,13 @@ component output="false" extends="wheels.Global"{
 			} else {
 				local.className = Reverse(SpanExcluding(Reverse(local.metaData.name), "."));
 			}
-			if (StructKeyExists(application[local.appKey].mixins, local.className)) {
+			// A plugin-free app still has an (empty) entry per class, so the outer guard
+			// passes; without this check every instance copied its variables scope into
+			// `core` for nothing. `core` only serves plugin overrides calling the original.
+			if (
+				StructKeyExists(application[local.appKey].mixins, local.className)
+				&& !StructIsEmpty(application[local.appKey].mixins[local.className])
+			) {
 				if (!StructKeyExists(variablesScope, "core")) {
 					variablesScope.core = {};
 					StructAppend(variablesScope.core, variablesScope);

@@ -165,7 +165,10 @@
 						local.rollback = true;
 					}
 
+					// What this save writes, from the write on (F49); put back if the save fails.
+					local.savedBefore = $savedChangesState();
 					$create(parameterize = arguments.parameterize, reload = arguments.reload);
+					$captureSavedChanges();
 					if (
 						$saveAssociations(argumentCollection = arguments)
 						&& $callback("afterCreate", arguments.callbacks)
@@ -173,11 +176,17 @@
 					) {
 						$updatePersistedProperties();
 						if (arguments.reload) {
-							this.reload();
+							$reloadKeepingSavedChanges();
 						}
 						local.rv = true;
-					} else if (local.rollback) {
-						$resetToNew();
+						// v4.2.0: queue afterCommit/afterRollback (fires at the outermost
+						// transaction resolve, or immediately in none/false mode).
+						$enqueueTransactionCallbacks(operation = "create", savedBefore = local.savedBefore, callbacks = arguments.callbacks);
+					} else {
+						$restoreSavedChanges(local.savedBefore);
+						if (local.rollback) {
+							$resetToNew();
+						}
 					}
 				} else {
 					$validateAssociations(callbacks = arguments.callbacks);
@@ -191,7 +200,9 @@
 					&& $callback("beforeSave", arguments.callbacks)
 					&& $callback("beforeUpdate", arguments.callbacks)
 				) {
+					local.savedBefore = $savedChangesState();
 					$update(parameterize = arguments.parameterize, reload = arguments.reload);
+					$captureSavedChanges();
 					if (
 						$saveAssociations(argumentCollection = arguments)
 						&& $callback("afterUpdate", arguments.callbacks)
@@ -199,9 +210,13 @@
 					) {
 						$updatePersistedProperties();
 						if (arguments.reload) {
-							this.reload();
+							$reloadKeepingSavedChanges();
 						}
 						local.rv = true;
+						// v4.2.0: queue afterCommit/afterRollback (see create branch).
+						$enqueueTransactionCallbacks(operation = "update", savedBefore = local.savedBefore, callbacks = arguments.callbacks);
+					} else {
+						$restoreSavedChanges(local.savedBefore);
 					}
 				} else {
 					$validateAssociations(callbacks = arguments.callbacks);
@@ -255,6 +270,7 @@
 		for (local.key in local.uuidBasedKeys) {
 			this[local.key] = generateUUID();
 		}
+		$fillRequiredUuidColumns(primaryKeys = local.pks);
 
 		// Start by adding column names and values for the properties that exist on the object to two arrays.
 		local.sql = [];
@@ -330,11 +346,44 @@
 	 * unsized char/varchar/text column a UUID candidate.
 	 */
 	public boolean function $isUUIDColumn(required struct columnMeta) {
+		// A native UUID type is unambiguous whatever size the driver reports: PostgreSQL,
+		// CockroachDB and H2 report `uuid` with no usable size (#4094).
+		if ($isNativeUuidColumn(arguments.columnMeta)) {
+			return true;
+		}
 		return (
 			listFindNoCase("uniqueidentifier,char,varchar,uuid,raw,text", arguments.columnMeta.dataType)
 			&& StructKeyExists(arguments.columnMeta, "size")
 			&& !IsNull(arguments.columnMeta.size)
 			&& arguments.columnMeta.size == 36
 		);
+	}
+
+	/**
+	 * Internal function. True for a column of a native UUID type (`uuid`, `uniqueidentifier`).
+	 */
+	public boolean function $isNativeUuidColumn(required struct columnMeta) {
+		return StructKeyExists(arguments.columnMeta, "dataType") && ListFindNoCase("uuid,uniqueidentifier", arguments.columnMeta.dataType);
+	}
+
+	/**
+	 * Internal function. Fills a blank, NOT NULL native UUID column that has no database
+	 * default with a generated UUID (#4094). Without it the insert fails: this happens when the
+	 * server is too old to generate one in a default (PostgreSQL before 13), or when a column was
+	 * created without one. Nullable columns and columns with a default are left alone.
+	 */
+	public void function $fillRequiredUuidColumns(required array primaryKeys) {
+		for (local.key in variables.wheels.class.properties) {
+			local.meta = variables.wheels.class.properties[local.key];
+			if (
+				!ArrayFindNoCase(arguments.primaryKeys, local.key)
+				&& $isNativeUuidColumn(local.meta)
+				&& !local.meta.nullable
+				&& !Len(local.meta.columndefault)
+				&& (!StructKeyExists(this, local.key) || IsNull(this[local.key]) || !Len(this[local.key]))
+			) {
+				this[local.key] = generateUUID();
+			}
+		}
 	}
 </cfscript>

@@ -44,6 +44,11 @@ component extends="wheels.WheelsTest" {
     // "function [X] does not exist in the String".
     this.browser = new wheels.wheelstest.UnwiredBrowserGuard();
     this.browserTestSkipped = false;
+    // Why the bundle's browser specs don't run. A skip reason reports each spec as
+    // Skipped; a launch error reports each spec as an Error, so a browser that
+    // could not start never reads as a pass.
+    this.browserTestSkipReason = "";
+    this.browserLaunchError = "";
     // Per-spec base-URL override (issue #2779). Highest-precedence layer in
     // $resolveBaseUrl(). Set in the component pseudo-constructor (the
     // `this.baseUrl = "..."` line outside any function in the subclass),
@@ -64,42 +69,117 @@ component extends="wheels.WheelsTest" {
         // defaults to skipping browser specs. Set WHEELS_BROWSER_CI_ENABLE=true
         // to force execution once the fixture server is verified in CI.
         if ($isCiSkipEnabled()) {
-            this.browserTestSkipped = true;
+            $skipBrowserSpecs("Browser specs are skipped in CI (WHEELS_CI is set). Set WHEELS_BROWSER_CI_ENABLE=true to run them.");
             return;
         }
 
         try {
             variables.$launcher = $ensureLauncher();
         } catch (Wheels.BrowserNotInstalled e) {
-            this.browserTestSkipped = true;
+            $skipBrowserSpecs("Playwright is not installed. Run `wheels browser setup` to run browser specs.");
             return;
         } catch (Wheels.BrowserJvmUnavailable e) {
-            // Engine has no JVM class loading (e.g. RustCFML) — same clean
-            // skip path as "Playwright not installed".
-            this.browserTestSkipped = true;
+            // Engine has no JVM class loading (e.g. RustCFML).
+            $skipBrowserSpecs("This engine cannot load Playwright (no JVM class loading), so browser specs do not run here.");
             return;
         }
         try {
             variables.$browser = variables.$launcher.acquireBrowser(engine=this.browserEngine);
         } catch (Wheels.BrowserLaunchTimedOut e) {
             // Watchdog trip: the Playwright driver stalled (broken node
-            // runtime / stuck install step). Skipping beats wedging the whole
-            // suite for as long as the driver hangs — previously this blocked
-            // the test-runner lock indefinitely and every later test request
-            // queued behind it.
-            this.browserTestSkipped = true;
-            debug(e.message);
+            // runtime / stuck install step). Not starting beats wedging the whole
+            // suite for as long as the driver hangs, but the specs did not run:
+            // they report as errors (or skips, when launch failures are opted out).
+            $browserLaunchFailed(e.message);
             return;
         } catch (Wheels.BrowserLaunchFailed e) {
-            // Playwright installed but unusable (missing browser binary,
-            // corrupt driver). Skip browser coverage rather than failing the
-            // run for a local environment issue; `wheels browser setup`
-            // repairs it.
-            this.browserTestSkipped = true;
-            debug(e.message);
+            // Playwright installed but unusable (missing browser binary or
+            // system libraries, corrupt driver).
+            $browserLaunchFailed(e.message);
             return;
         }
         variables.$baseUrl = $resolveBaseUrl();
+    }
+
+    /**
+     * Marks this bundle's browser specs as skipped, with the reason each one reports.
+     */
+    public void function $skipBrowserSpecs(required string reason) {
+        this.browserTestSkipped = true;
+        this.browserTestSkipReason = arguments.reason;
+    }
+
+    /**
+     * The browser could not be started. Each browser spec then reports an error with
+     * this message, unless WHEELS_BROWSER_SKIP_LAUNCH_FAILURES=true asks to skip them.
+     */
+    public void function $browserLaunchFailed(required string message) {
+        if ($launchFailuresSkipped()) {
+            this.browserTestSkipped = true;
+            this.browserTestSkipReason = "The browser could not be started (WHEELS_BROWSER_SKIP_LAUNCH_FAILURES is set): " & arguments.message;
+        } else {
+            // Not a skip: browserTestSkipped stays false so a spec guarded by the
+            // old `if (this.browserTestSkipped) return;` does not pass silently,
+            // and this.browser raises the launch error instead of "not wired".
+            this.browserLaunchError = arguments.message;
+            var guard = new wheels.wheelstest.UnwiredBrowserGuard();
+            guard.$launchError = $browserSpecGate().message;
+            this.browser = guard;
+        }
+        try {
+            debug(arguments.message);
+        } catch (any e) {
+            // debug() needs a TestBox run; the gate above is what reports the failure.
+        }
+    }
+
+    /**
+     * What happens to a browser spec in this bundle: "run", "skip" (with the skip
+     * reason) or "error" (with the launch error). Used by browserDescribe().
+     */
+    public struct function $browserSpecGate() {
+        if (Len(this.browserLaunchError)) {
+            return {
+                action = "error",
+                message = "The browser could not be started, so this browser spec did not run: " & this.browserLaunchError
+                    & " Fix the browser install (`wheels browser setup`), or set WHEELS_BROWSER_SKIP_LAUNCH_FAILURES=true to skip browser specs instead."
+            };
+        }
+        if (this.browserTestSkipped) {
+            return {action = "skip", message = Len(this.browserTestSkipReason) ? this.browserTestSkipReason : "Browser specs are skipped."};
+        }
+        return {action = "run", message = ""};
+    }
+
+    /**
+     * Call first in a browser spec that is not inside browserDescribe() (which applies
+     * this for you): skips the spec, with the reason, when browser specs cannot run
+     * here, and fails it when the browser could not be started. Returns true when the
+     * spec should run.
+     *
+     *     it("signs up", () => {
+     *         browserSpecGuard();
+     *         ...
+     *     });
+     */
+    public boolean function browserSpecGuard() {
+        var gate = $browserSpecGate();
+        if (gate.action == "error") {
+            throw(type = "Wheels.BrowserLaunchFailed", message = gate.message);
+        }
+        if (gate.action == "skip") {
+            skip(gate.message);
+        }
+        return true;
+    }
+
+    private boolean function $launchFailuresSkipped() {
+        try {
+            var value = createObject("java", "java.lang.System").getenv("WHEELS_BROWSER_SKIP_LAUNCH_FAILURES") ?: "";
+            return listFindNoCase("true,1,yes", value) > 0;
+        } catch (any e) {
+            return false;
+        }
     }
 
     /**
@@ -164,8 +244,12 @@ component extends="wheels.WheelsTest" {
                 // hand-written `if (this.browserTestSkipped) return;` guards —
                 // a forgotten guard used to hit the UnwiredBrowserGuard
                 // sentinel and fail in CI instead of skipping.
-                if (me.browserTestSkipped) {
-                    return;
+                var gate = me.$browserSpecGate();
+                if (gate.action == "error") {
+                    throw(type = "Wheels.BrowserLaunchFailed", message = gate.message);
+                }
+                if (gate.action == "skip") {
+                    me.skip(gate.message);
                 }
                 try {
                     arguments.spec.body();
@@ -186,6 +270,9 @@ component extends="wheels.WheelsTest" {
      * manually instead of using browserDescribe().
      */
     public void function $startBrowserContext() {
+        if (Len(this.browserLaunchError)) {
+            throw(type = "Wheels.BrowserLaunchFailed", message = $browserSpecGate().message);
+        }
         if (this.browserTestSkipped) return;
 
         // A spec that overrides beforeAll() without calling super.beforeAll()
@@ -225,7 +312,11 @@ component extends="wheels.WheelsTest" {
         if (Len(variables.$baseUrl ?: "")) {
             try {
                 var ctx = new wheels.events.TestContext();
-                this.browser.setCookie(name = ctx.cookieName(), value = "1", url = variables.$baseUrl);
+                // The cookie backup must carry the per-process runner
+                // secret too. If the extraHTTPHeaders context fell back above, this
+                // loopback cookie is the only isolation marker left, and the gate
+                // now rejects a bare "1".
+                this.browser.setCookie(name = ctx.cookieName(), value = ctx.testSecret(), url = variables.$baseUrl);
             } catch (any cookieErr) {
                 // Best-effort: header may already be on the context.
             }
@@ -305,9 +396,14 @@ component extends="wheels.WheelsTest" {
      *   2. get("browserTestBaseUrl")          — Wheels setting
      *   3. -Dwheels.browserTest.baseUrl=...   — JVM system property
      *   4. WHEELS_BROWSER_TEST_BASE_URL env   — CI / shell
-     *   5. $detectBaseUrlFromCgi(cgi)         — derived from the in-flight
+     *   5. probed servlet local listen port   — when the request's local port
+     *                                            differs from its Host port,
+     *                                            probe the loopback candidate
+     *                                            (http then https) and use the
+     *                                            one that answers as HTTP
+     *   6. $detectBaseUrlFromCgi(cgi)         — derived from the in-flight
      *                                            test-runner request
-     *   6. "http://localhost:8080" default    — bare LuCLI port
+     *   7. "http://localhost:8080" default    — bare LuCLI port
      *
      * For specs that use only `visitUrl(absolute)` (e.g. data:/file:), the
      * baseUrl is effectively unused.
@@ -315,6 +411,37 @@ component extends="wheels.WheelsTest" {
     public string function $resolveBaseUrl() {
         if (len(this.baseUrl ?: "")) return this.baseUrl;
 
+        var configured = $configuredBrowserBaseUrl();
+        if (len(configured)) return configured;
+
+        try {
+            var mapped = $resolveServletLoopbackBaseUrl(cgi);
+            if (len(mapped)) return mapped;
+        } catch (any e) {
+            // Servlet request unavailable or probe failed — fall through to cgi.
+        }
+
+        try {
+            var detected = $detectBaseUrlFromCgi(cgi);
+            if (len(detected)) return detected;
+        } catch (any e) {
+            // cgi scope unavailable (rare; e.g. background thread) — fall
+            // through to the hardcoded default.
+        }
+
+        return "http://localhost:8080";
+    }
+
+    /**
+     * The configured (non-per-instance) browser base URL override: the
+     * `browserTestBaseUrl` setting, then `-Dwheels.browserTest.baseUrl`, then
+     * the `WHEELS_BROWSER_TEST_BASE_URL` env var, or "" when none is set. A
+     * public seam so resolver-level specs can neutralise every ambient
+     * override at once — the env var in particular cannot be unset from the
+     * JVM, so save/restore is not an option — and drive the probe/cgi path
+     * deterministically regardless of the CI environment.
+     */
+    public string function $configuredBrowserBaseUrl() {
         try {
             var setting = get(name="browserTestBaseUrl");
             if (len(setting ?: "")) return setting;
@@ -330,18 +457,9 @@ component extends="wheels.WheelsTest" {
             if (!isNull(env) && len(env)) return env;
         } catch (any e) {
             // Best-effort: a SecurityManager could deny system access.
-            // Falling through to CGI detection / default is correct.
         }
 
-        try {
-            var detected = $detectBaseUrlFromCgi(cgi);
-            if (len(detected)) return detected;
-        } catch (any e) {
-            // cgi scope unavailable (rare; e.g. background thread) — fall
-            // through to the hardcoded default.
-        }
-
-        return "http://localhost:8080";
+        return "";
     }
 
     /**
@@ -412,7 +530,10 @@ component extends="wheels.WheelsTest" {
     private any function $buildContextOptions() {
         var ctx = new wheels.events.TestContext();
         var headerMap = CreateObject("java", "java.util.LinkedHashMap").init();
-        headerMap.put(ctx.headerName(), "1");
+        // Send the per-process runner secret (not a fixed "1").
+        // Playwright requests originate from loopback, so the framework gate
+        // binds the isolated application only for this trusted runner.
+        headerMap.put(ctx.headerName(), ctx.testSecret());
         var setterMap = {setExtraHTTPHeaders: headerMap};
 
         if (StructKeyExists(this, "browserViewport") && Len(this.browserViewport ?: "")) {

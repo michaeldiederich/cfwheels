@@ -46,6 +46,30 @@ component extends="wheels.WheelsTest" {
 				expect(local.result.status).toBe("pending");
 			});
 
+			it("does not mutate the caller's data struct (##3887)", function() {
+				local.job = new wheels.Job();
+				prepareMock(local.job);
+				local.payload = {id: 1};
+				local.job.enqueue(data = local.payload);
+				expect(StructKeyExists(local.payload, "$wheelsJobTimeout")).toBeFalse(
+					"enqueue() must not add internal keys to the caller's struct"
+				);
+				expect(StructCount(local.payload)).toBe(1, "the caller's struct must be unchanged (only its own keys)");
+			});
+
+			it("leaves the caller's nested structs untouched — only top-level keys are added (##3887)", function() {
+				// $enqueueJob only ADDS top-level keys, so a shallow copy is correct: the
+				// caller's nested structs may be shared by reference but are never mutated.
+				local.job = new wheels.Job();
+				prepareMock(local.job);
+				local.payload = {id: 1, meta: {name: "a"}};
+				local.job.enqueue(data = local.payload);
+				expect(StructKeyExists(local.payload, "$wheelsJobTimeout")).toBeFalse("no internal key on the caller's top level");
+				expect(StructCount(local.payload)).toBe(2, "only the caller's own top-level keys (id, meta)");
+				expect(StructCount(local.payload.meta)).toBe(1, "the nested struct is untouched");
+				expect(local.payload.meta.name).toBe("a");
+			});
+
 			it("enqueue accepts custom queue name", function() {
 				local.job = new wheels.Job();
 				prepareMock(local.job);
@@ -89,7 +113,7 @@ component extends="wheels.WheelsTest" {
 		describe("Job Configuration Override", function() {
 
 			it("subclass can override default configuration", function() {
-				local.job = new app.jobs.ProcessOrdersJob();
+				local.job = new wheels.tests._assets.jobs.ProcessOrdersJob();
 				expect(local.job.queue).toBe("default");
 				expect(local.job.maxRetries).toBe(3);
 			});
@@ -167,6 +191,23 @@ component extends="wheels.WheelsTest" {
 				expect(local.result).toBeStruct();
 				expect(local.result).toHaveKey("processed");
 			});
+
+			it("processQueue processes every due job with limit 0 and stops at a positive limit", function() {
+				var batch = new wheels.tests._assets.jobs.ProcessOrdersJob();
+				try {
+					// More than the 25-row default of the SQL limit clause, so 0 can't silently mean 25.
+					for (var i = 1; i <= 26; i++) {
+						batch.enqueue(data = {n = i}, queue = "test_limit_zero");
+					}
+					var job = new wheels.Job();
+					var bounded = job.processQueue(queue = "test_limit_zero", limit = 10);
+					expect(bounded.processed).toBe(10);
+					var unbounded = job.processQueue(queue = "test_limit_zero", limit = 0);
+					expect(unbounded.processed).toBe(16, "limit 0 means no limit: every remaining due job is processed");
+				} finally {
+					queryExecute("DELETE FROM wheels_jobs WHERE queue = 'test_limit_zero'", {}, {datasource = application.wheels.dataSourceName});
+				}
+			});
 		});
 
 		describe("Job Claim Guard", function() {
@@ -184,7 +225,7 @@ component extends="wheels.WheelsTest" {
 
 			it("does not execute a job already claimed by another worker", function() {
 				// Enqueue using a concrete subclass so jobClass resolves correctly
-				local.testJob = new app.jobs.ProcessOrdersJob();
+				local.testJob = new wheels.tests._assets.jobs.ProcessOrdersJob();
 				local.enqueued = local.testJob.enqueue(data = {}, queue = "test_claim_guard");
 				expect(local.enqueued).toHaveKey("persisted");
 				expect(local.enqueued.persisted).toBeTrue();
@@ -199,7 +240,7 @@ component extends="wheels.WheelsTest" {
 				// Build the job row as processQueue's SELECT would have seen it pre-claim
 				local.jobRow = {
 					id = local.enqueued.id,
-					jobClass = "app.jobs.ProcessOrdersJob",
+					jobClass = "wheels.tests._assets.jobs.ProcessOrdersJob",
 					queue = "test_claim_guard",
 					data = "{}",
 					attempts = 0,
@@ -259,18 +300,18 @@ component extends="wheels.WheelsTest" {
 		describe("Example Job (ProcessOrdersJob)", function() {
 
 			it("can be instantiated", function() {
-				local.job = new app.jobs.ProcessOrdersJob();
+				local.job = new wheels.tests._assets.jobs.ProcessOrdersJob();
 				expect(local.job).toBeInstanceOf("wheels.Job");
 			});
 
 			it("has a perform method", function() {
-				local.job = new app.jobs.ProcessOrdersJob();
+				local.job = new wheels.tests._assets.jobs.ProcessOrdersJob();
 				expect(local.job).toHaveKey("perform");
 			});
 
 			it("perform executes without error", function() {
 				var performed = {ok = true, error = ""};
-				local.job = new app.jobs.ProcessOrdersJob();
+				local.job = new wheels.tests._assets.jobs.ProcessOrdersJob();
 				try {
 					local.job.perform(data = {batchSize: 5});
 				} catch (any e) {
@@ -282,7 +323,7 @@ component extends="wheels.WheelsTest" {
 			});
 
 			it("can be enqueued", function() {
-				local.job = new app.jobs.ProcessOrdersJob();
+				local.job = new wheels.tests._assets.jobs.ProcessOrdersJob();
 				local.result = local.job.enqueue(data = {batchSize: 10});
 				expect(local.result).toBeStruct();
 				expect(local.result).toHaveKey("id");

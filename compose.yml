@@ -10,8 +10,11 @@ services:
     build:
       context: ./tools/docker/testui
     image: wheels-testui:v2.0.0
+    # Opt-in (not started by a bare `docker compose up`): docker compose --profile ui up -d
+    profiles: ["ui"]
+    # Localhost only: the UI can stop and restart containers through the Docker socket.
     ports:
-      - "3000:80"
+      - "127.0.0.1:3000:80"
     # Add extra_hosts to allow container to access host services
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -41,6 +44,15 @@ services:
       context: ./
       dockerfile: ./tools/docker/lucee5/Dockerfile
     image: wheels-test-lucee5:v1.0.2
+    environment:
+      # The constructor test-context gate honours WHEELS_ENV;
+      # the core suite runs in development (config/environment.cfm). Default to
+      # development so the isolated _wheelsTest binding stays on; smoke-env
+      # overrides this per leg.
+      - "WHEELS_ENV=${WHEELS_ENV:-development}"
+      # Runs through this file are framework-repository runs: specs that skip outside
+      # the repository must not skip here (RequireRepoPathSpec fails instead).
+      - "WHEELS_EXPECT_REPO=true"
     volumes:
       - ./:/wheels-test-suite
       - type: bind
@@ -56,7 +68,7 @@ services:
         source: ./tools/docker/lucee5/CFConfig.json
         target: /wheels-test-suite/CFConfig.json
     ports:
-      - "60005:60005"
+      - "127.0.0.1:60005:60005"
     networks:
       - wheels-network
 
@@ -65,6 +77,15 @@ services:
       context: ./
       dockerfile: ./tools/docker/lucee6/Dockerfile
     image: wheels-test-lucee6:v1.0.2
+    environment:
+      # The constructor test-context gate honours WHEELS_ENV;
+      # the core suite runs in development (config/environment.cfm). Default to
+      # development so the isolated _wheelsTest binding stays on; smoke-env
+      # overrides this per leg.
+      - "WHEELS_ENV=${WHEELS_ENV:-development}"
+      # Runs through this file are framework-repository runs: specs that skip outside
+      # the repository must not skip here (RequireRepoPathSpec fails instead).
+      - "WHEELS_EXPECT_REPO=true"
     volumes:
       - ./:/wheels-test-suite
       - type: bind
@@ -80,7 +101,7 @@ services:
         source: ./tools/docker/lucee6/CFConfig.json
         target: /wheels-test-suite/CFConfig.json
     ports:
-      - "60006:60006"
+      - "127.0.0.1:60006:60006"
     networks:
       - wheels-network
     healthcheck:
@@ -95,6 +116,18 @@ services:
       context: ./
       dockerfile: ./tools/docker/lucee7/Dockerfile
     image: wheels-test-lucee7:v1.0.0
+    environment:
+      # The constructor test-context gate honours WHEELS_ENV;
+      # the core suite runs in development (config/environment.cfm). Default to
+      # development so the isolated _wheelsTest binding stays on; smoke-env
+      # overrides this per leg.
+      - "WHEELS_ENV=${WHEELS_ENV:-development}"
+      # Runs through this file are framework-repository runs: specs that skip outside
+      # the repository must not skip here (RequireRepoPathSpec fails instead).
+      - "WHEELS_EXPECT_REPO=true"
+      # The engine's time zone: UTC unless ENGINE_TZ is set (the compat matrix TZ lanes, or
+      # ENGINE_TZ=... locally). The JVM follows TZ on Linux; EngineTimeZoneSpec checks it did.
+      - "TZ=${ENGINE_TZ:-UTC}"
     volumes:
       - ./:/wheels-test-suite
       - type: bind
@@ -110,7 +143,7 @@ services:
         source: ./tools/docker/lucee7/CFConfig.json
         target: /wheels-test-suite/CFConfig.json
     ports:
-      - "60007:60007"
+      - "127.0.0.1:60007:60007"
     networks:
       - wheels-network
 
@@ -119,6 +152,15 @@ services:
       context: ./
       dockerfile: ./tools/docker/adobe2018/Dockerfile
     image: wheels-test-adobe2018:v1.0.2
+    environment:
+      # The constructor test-context gate honours WHEELS_ENV;
+      # the core suite runs in development (config/environment.cfm). Default to
+      # development so the isolated _wheelsTest binding stays on; smoke-env
+      # overrides this per leg.
+      - "WHEELS_ENV=${WHEELS_ENV:-development}"
+      # Runs through this file are framework-repository runs: specs that skip outside
+      # the repository must not skip here (RequireRepoPathSpec fails instead).
+      - "WHEELS_EXPECT_REPO=true"
     tty: true          
     stdin_open: true
     volumes:
@@ -136,7 +178,7 @@ services:
         source: ./tools/docker/adobe2018/CFConfig.json
         target: /wheels-test-suite/CFConfig.json
     ports:
-      - "62018:62018"
+      - "127.0.0.1:62018:62018"
     networks:
       - wheels-network
 
@@ -145,6 +187,15 @@ services:
       context: ./
       dockerfile: ./tools/docker/adobe2021/Dockerfile
     image: wheels-test-adobe2021:v1.0.2
+    environment:
+      # The constructor test-context gate honours WHEELS_ENV;
+      # the core suite runs in development (config/environment.cfm). Default to
+      # development so the isolated _wheelsTest binding stays on; smoke-env
+      # overrides this per leg.
+      - "WHEELS_ENV=${WHEELS_ENV:-development}"
+      # Runs through this file are framework-repository runs: specs that skip outside
+      # the repository must not skip here (RequireRepoPathSpec fails instead).
+      - "WHEELS_EXPECT_REPO=true"
     tty: true          
     stdin_open: true
     volumes:
@@ -163,7 +214,7 @@ services:
         source: ./tools/docker/adobe2021/CFConfig.json
         target: /wheels-test-suite/CFConfig.json
     ports:
-      - "62021:62021"
+      - "127.0.0.1:62021:62021"
     networks:
       - wheels-network
 
@@ -177,6 +228,15 @@ services:
       context: ./
       dockerfile: ./tools/docker/adobe2023/Dockerfile
     image: wheels-test-adobe2023:v1.0.1
+    environment:
+      # The constructor test-context gate honours WHEELS_ENV;
+      # the core suite runs in development (config/environment.cfm). Default to
+      # development so the isolated _wheelsTest binding stays on; smoke-env
+      # overrides this per leg.
+      - "WHEELS_ENV=${WHEELS_ENV:-development}"
+      # Runs through this file are framework-repository runs: specs that skip outside
+      # the repository must not skip here (RequireRepoPathSpec fails instead).
+      - "WHEELS_EXPECT_REPO=true"
     tty: true
     stdin_open: true
     volumes:
@@ -195,7 +255,7 @@ services:
         source: ./tools/docker/adobe2023/CFConfig.json
         target: /wheels-test-suite/CFConfig.json
     ports:
-      - "62023:62023"
+      - "127.0.0.1:62023:62023"
     deploy:
       resources:
         limits:
@@ -218,6 +278,18 @@ services:
       context: ./
       dockerfile: ./tools/docker/adobe2025/Dockerfile
     image: wheels-test-adobe2025:v1.0.0
+    environment:
+      # The constructor test-context gate honours WHEELS_ENV;
+      # the core suite runs in development (config/environment.cfm). Default to
+      # development so the isolated _wheelsTest binding stays on; smoke-env
+      # overrides this per leg.
+      - "WHEELS_ENV=${WHEELS_ENV:-development}"
+      # Runs through this file are framework-repository runs: specs that skip outside
+      # the repository must not skip here (RequireRepoPathSpec fails instead).
+      - "WHEELS_EXPECT_REPO=true"
+      # The engine's time zone: UTC unless ENGINE_TZ is set (the compat matrix TZ lanes, or
+      # ENGINE_TZ=... locally). The JVM follows TZ on Linux; EngineTimeZoneSpec checks it did.
+      - "TZ=${ENGINE_TZ:-UTC}"
     tty: true
     stdin_open: true
     volumes:
@@ -236,7 +308,7 @@ services:
         source: ./tools/docker/adobe2025/CFConfig.json
         target: /wheels-test-suite/CFConfig.json
     ports:
-      - "62025:62025"
+      - "127.0.0.1:62025:62025"
     deploy:
       resources:
         limits:
@@ -254,6 +326,18 @@ services:
       context: ./
       dockerfile: ./tools/docker/boxlang/Dockerfile
     image: wheels-test-boxlang:v1.0.0
+    environment:
+      # The constructor test-context gate honours WHEELS_ENV;
+      # the core suite runs in development (config/environment.cfm). Default to
+      # development so the isolated _wheelsTest binding stays on; smoke-env
+      # overrides this per leg.
+      - "WHEELS_ENV=${WHEELS_ENV:-development}"
+      # Runs through this file are framework-repository runs: specs that skip outside
+      # the repository must not skip here (RequireRepoPathSpec fails instead).
+      - "WHEELS_EXPECT_REPO=true"
+      # The engine's time zone: UTC unless ENGINE_TZ is set (the compat matrix TZ lanes, or
+      # ENGINE_TZ=... locally). The JVM follows TZ on Linux; EngineTimeZoneSpec checks it did.
+      - "TZ=${ENGINE_TZ:-UTC}"
     tty: true
     stdin_open: true
     volumes:
@@ -271,7 +355,7 @@ services:
         source: ./tools/docker/boxlang/CFConfig.json
         target: /wheels-test-suite/CFConfig.json
     ports:
-      - "60001:60001"
+      - "127.0.0.1:60001:60001"
     networks:
       - wheels-network
 
@@ -284,7 +368,7 @@ services:
       MYSQL_USER: wheelstestdb
       MYSQL_PASSWORD: wheelstestdb
     ports:
-      - "3307:3306"
+      - "127.0.0.1:3307:3306"
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p$$MYSQL_ROOT_PASSWORD"]
       interval: 10s
@@ -304,7 +388,7 @@ services:
       POSTGRES_PASSWORD: wheelstestdb
       POSTGRES_INITDB_ARGS: --auth-host=md5
     ports:
-      - "5433:5432"
+      - "127.0.0.1:5433:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U wheelstestdb"]
       interval: 10s
@@ -328,7 +412,7 @@ services:
       MSSQL_PID: Developer
       MSSQL_MEMORY_LIMIT_MB: 2048
     ports:
-      - "1434:1433"
+      - "127.0.0.1:1434:1433"
     healthcheck:
       test: /opt/mssql-tools18/bin/sqlcmd -S localhost -U SA -P "$$MSSQL_SA_PASSWORD" -Q "SELECT 1" -C || exit 1
       interval: 30s
@@ -351,8 +435,8 @@ services:
     restart: always
     command: start-single-node --insecure --advertise-addr=cockroachdb
     ports:
-      - "26258:26257"
-      - "8081:8080"
+      - "127.0.0.1:26258:26257"
+      - "127.0.0.1:8081:8080"
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8080/health?ready=1"]
       interval: 10s
@@ -383,7 +467,7 @@ services:
       APP_USER: wheelstestdb
       APP_USER_PASSWORD: wheelstestdb
     ports:
-      - "1522:1521"
+      - "127.0.0.1:1522:1521"
     volumes:
       - ./tools/docker/Oracle:/container-entrypoint-startdb.d
     healthcheck:

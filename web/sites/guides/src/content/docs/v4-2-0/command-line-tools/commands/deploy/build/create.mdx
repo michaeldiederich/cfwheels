@@ -1,0 +1,43 @@
+---
+title: "wheels deploy build create"
+description: Create a named docker buildx builder on the control machine.
+type: reference
+sidebar:
+  label: "create"
+  order: 4
+---
+
+Create a `docker buildx` builder on the control machine. One-time setup for multi-arch builds and remote builds.
+
+## Synopsis
+
+```txt title="
+wheels deploy build create [--destination=<name>] [--dry-run]
+```
+
+## Flags
+
+| Flag | Description |
+|------|-------------|
+| `--destination=<name>` | Overlay destination config. |
+| `--dry-run` | Print the commands without executing. |
+
+## When to run
+
+Once, before the first build, when `builder.remote` is set. [`build push`](../push/) then builds with `--builder kamal-<service>`, so that builder must exist. Without `builder.remote`, `build push` uses your current default builder and doesn't need this.
+
+## Behavior
+
+Emits `docker buildx create --name kamal-<service> --driver=docker-container` on the control machine. When `builder.remote` is set, its endpoint is passed too, so the builder runs on that host:
+
+```txt
+[local] docker buildx create --name kamal-ddapp --driver=docker-container 'ssh://deploy@192.0.2.50'
+```
+
+The builder is not selected with `--use`; `build push` names it with `--builder` instead.
+
+## Example
+
+```bash title="Example"
+wheels deploy build create
+```
