@@ -131,10 +131,12 @@ component {
 	public any function $dateOrTimeSelectNormalizeValue(required any value) {
 		local.value = arguments.value;
 		// Added this section for Adobe Coldfusion as it returns a "java.time.LocalDateTime" object for datetime data
-		if(isInstanceOf(local.value,"java.time.LocalDateTime")){
-			local.value = createDateTime(local.value.getYear(),local.value.getMonthValue(),local.value.getDayOfMonth(),local.value.getHour(),local.value.getMinute(),local.value.getSecond());
-		} else if (isInstanceOf(local.value, "oracle.sql.TIMESTAMP")){
-			local.value = local.value.timestampValue();
+		if (!isNull(local.value) && isObject(local.value)) {
+			if (isInstanceOf(local.value, "java.time.LocalDateTime")) {
+				local.value = createDateTime(local.value.getYear(), local.value.getMonthValue(), local.value.getDayOfMonth(), local.value.getHour(), local.value.getMinute(), local.value.getSecond());
+			} else if (isInstanceOf(local.value, "oracle.sql.TIMESTAMP")) {
+				local.value = local.value.timestampValue();
+			}
 		}
 		if ($engineAdapter().isBoxLang() && IsSimpleValue(local.value) && Len(local.value)) {
 			// Engine compatibility: Fix date parsing issues
